@@ -1,0 +1,165 @@
+# ================================================================
+# .gitignore para Voice Assistant Azure VoiceLive
+# ================================================================
+
+# ===== CREDENCIAIS E SEGREDOS =====
+# NUNCA commitar arquivos com credenciais!
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+secrets/
+credentials/
+
+# ===== PYTHON =====
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+virtualenv/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# ===== LOGS E DADOS =====
+# Arquivos de log
+logs/
+*.log
+*.logs
+
+# Dados temporários
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Gravações de áudio (se houver)
+recordings/
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# ===== IDEs E EDITORES =====
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# ===== SISTEMA OPERACIONAL =====
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ===== AZURE E ESPECÍFICOS DO PROJETO =====
+# Arquivos de configuração local do Azure
+.azure/
+azureconfig/
+
+# Backups de configuração
+*.backup
+*.bak
+*.old
+
+# ===== ARQUIVOS A MANTER (Comentados para clareza) =====
+# agent_config.json - PODE ser versionado (sem credenciais)
+# CONFIG_GUIDE.md - Documentação
+# AGENT_CONFIG_README.md - Documentação
+# main.py - Código fonte
+# agent_config_loader.py - Código fonte
+
+# ===== OUTROS =====
+# Node.js (caso adicione frontend)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Arquivos grandes
+*.zip
+*.tar.gz
+*.rar
+
+# Arquivos de banco de dados local
+*.db
+*.sqlite
+*.sqlite3
+
+# Cache do sistema
+.cache/
+*.cache
