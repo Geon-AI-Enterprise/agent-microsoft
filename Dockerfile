@@ -19,27 +19,23 @@ ENV PYTHONUNBUFFERED=1 \
 # Diretório de trabalho
 WORKDIR /app
 
-# ===== STAGE 2: Dependencies =====
+# ===== STAGE 2: Dependencies (CORRIGIDO) =====
 FROM base as dependencies
 
-# Instala dependências do sistema (se necessário para PyAudio em dev)
+# Instala TODAS as dependências do sistema necessárias para compilar pacotes nativos (PyAudio)
+# Inclui portaudio19-dev, gcc, python3-dev e libasound2-dev
 RUN apt-get update && apt-get install -y --no-install-recommends \
     portaudio19-dev \
     gcc \
+    python3-dev \
+    libasound2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copia apenas requirements primeiro (cache do Docker)
 COPY requirements.txt .
 
-# Instala dependências Python
+# Instala dependências Python (agora com as libs de compilação instaladas)
 RUN pip install --no-cache-dir -r requirements.txt
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    portaudio19-dev \
-    python3-dev \
-    gcc \
-    libasound2-dev \
-    && rm -rf /var/lib/apt/lists/*
 
 
 # ===== STAGE 3: Application =====
@@ -66,7 +62,8 @@ EXPOSE 8000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/health')" || exit 1
+    CMD python -c "import requests; requests.get('http://localhost:8000/health')" || \
+    exit 1
 
 # Comando padrão
 CMD ["python", "-m", "src.main"]
