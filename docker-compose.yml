@@ -1,0 +1,102 @@
+# ================================================================
+# docker-compose.yml - Orquestração Multi-Ambiente
+# ================================================================
+version: '3.8'
+
+services:
+  # ===== DEVELOPMENT =====
+  voicelive-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voicelive-agent-dev
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.development
+    environment:
+      - APP_ENV=development
+    volumes:
+      # Hot-reload em development
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./logs:/app/logs
+    networks:
+      - voicelive-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ===== STAGING =====
+  voicelive-staging:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voicelive-agent-staging
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env.staging
+    environment:
+      - APP_ENV=staging
+      - PORT=8001
+    volumes:
+      - staging-logs:/app/logs
+    networks:
+      - voicelive-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ===== PRODUCTION =====
+  voicelive-prod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voicelive-agent-prod
+    restart: always
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.production
+    environment:
+      - APP_ENV=production
+    volumes:
+      - prod-logs:/app/logs
+    networks:
+      - voicelive-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Limites de recursos (ajuste conforme necessário)
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+
+# ===== VOLUMES =====
+volumes:
+  staging-logs:
+    driver: local
+  prod-logs:
+    driver: local
+
+# ===== NETWORKS =====
+networks:
+  voicelive-network:
+    driver: bridge

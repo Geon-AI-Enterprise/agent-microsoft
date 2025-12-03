@@ -1,0 +1,84 @@
+# ================================================================
+# .dockerignore - Otimiza build do Docker
+# ================================================================
+
+# ===== NÃO copiar para imagem Docker =====
+
+# Ambientes virtuais Python
+.venv/
+venv/
+env/
+ENV/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Testes e coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Logs locais
+logs/
+*.log
+
+# Credenciais locais (importantes!)
+.env
+.env.local
+.env.development
+.env.staging
+.env.production
+*.key
+*.pem
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentação de desenvolvimento
+*.md
+!README.md
+
+# Arquivos temporários
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+.docker/
+
+# Testes
+test_*.py
+*_test.py
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Arquivos grandes desnecessários
+*.zip
+*.tar.gz
+recordings/
+*.wav
+*.mp3

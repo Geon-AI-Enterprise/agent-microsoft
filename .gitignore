@@ -1,12 +1,17 @@
 # ================================================================
-# .gitignore para Voice Assistant Azure VoiceLive
+# .gitignore - Azure VoiceLive Agent Multi-Tenant
 # ================================================================
 
-# ===== CREDENCIAIS E SEGREDOS =====
-# NUNCA commitar arquivos com credenciais!
+# ===== CREDENCIAIS E SEGREDOS (CRÍTICO!) =====
+# NUNCA commitar arquivos com credenciais reais!
 .env
 .env.local
 .env.*.local
+.env.development
+.env.staging
+.env.production
+
+# Chaves e certificados
 *.key
 *.pem
 secrets/
@@ -61,7 +66,6 @@ coverage.xml
 .pytest_cache/
 
 # ===== LOGS E DADOS =====
-# Arquivos de log
 logs/
 *.log
 *.logs
@@ -72,7 +76,7 @@ logs/
 temp/
 tmp/
 
-# Gravações de áudio (se houver)
+# Gravações de áudio
 recordings/
 *.wav
 *.mp3
@@ -90,20 +94,6 @@ recordings/
 *.iws
 .idea_modules/
 
-# Sublime Text
-*.sublime-project
-*.sublime-workspace
-
-# Vim
-*.swp
-*.swo
-*~
-
-# Emacs
-*~
-\#*\#
-.\#*
-
 # Jupyter Notebook
 .ipynb_checkpoints
 *.ipynb
@@ -111,7 +101,6 @@ recordings/
 # ===== SISTEMA OPERACIONAL =====
 # Windows
 Thumbs.db
-ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 *.lnk
@@ -127,39 +116,40 @@ $RECYCLE.BIN/
 .directory
 .Trash-*
 
-# ===== AZURE E ESPECÍFICOS DO PROJETO =====
-# Arquivos de configuração local do Azure
+# ===== DOCKER =====
+# Não ignorar Dockerfile e docker-compose.yml
+# Mas ignorar volumes e dados do container
+docker-volumes/
+.docker/
+
+# ===== AZURE =====
 .azure/
 azureconfig/
 
-# Backups de configuração
+# ===== BACKUPS =====
 *.backup
 *.bak
 *.old
 
-# ===== ARQUIVOS A MANTER (Comentados para clareza) =====
-# agent_config.json - PODE ser versionado (sem credenciais)
-# CONFIG_GUIDE.md - Documentação
-# AGENT_CONFIG_README.md - Documentação
-# main.py - Código fonte
-# agent_config_loader.py - Código fonte
+# ===== CACHE =====
+.cache/
+*.cache
 
-# ===== OUTROS =====
-# Node.js (caso adicione frontend)
-node_modules/
-package-lock.json
-yarn.lock
-
-# Arquivos grandes
+# ===== ARQUIVOS GRANDES =====
 *.zip
 *.tar.gz
 *.rar
 
-# Arquivos de banco de dados local
+# ===== BANCO DE DADOS LOCAL =====
 *.db
 *.sqlite
 *.sqlite3
 
-# Cache do sistema
-.cache/
-*.cache
+# ===== ARQUIVOS A COMMITAR =====
+# ✅ .env.example - Template (SIM)
+# ✅ agent_config.json - Config padrão (SIM)
+# ✅ Dockerfile - Deploy (SIM)
+# ✅ docker-compose.yml - Orquestração (SIM)
+# ✅ *.py - Código fonte (SIM)
+# ✅ requirements.txt - Dependências (SIM)
+# ✅ README.md - Documentação (SIM)

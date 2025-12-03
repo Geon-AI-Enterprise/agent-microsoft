@@ -8,9 +8,9 @@
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
     "turn_detection": {
-        "threshold": 0.5,
-        "prefix_padding_ms": 300,
-        "silence_duration_ms": 500
+        "threshold": 0.7,
+        "prefix_padding_ms": 100,
+        "silence_duration_ms": 200
     },
     "audio": {
         "input_format": "PCM16",

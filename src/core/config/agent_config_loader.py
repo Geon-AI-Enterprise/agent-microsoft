@@ -2,21 +2,77 @@
 Módulo para carregar e gerenciar configurações do agente de voz
 """
 import json
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class AgentConfig:
     """Classe para gerenciar configurações do agente de forma simples"""
     
-    def __init__(self, config_path: str = "agent_config.json"):
+    def __init__(self, config_path: str = "agent_config.json", env: str = "development"):
         """
         Inicializa a configuração do agente
         
         Args:
-            config_path: Caminho para o arquivo de configuração JSON
+            config_path: Caminho para o arquivo de configuração JSON padrão
+            env: Ambiente atual (development, staging, production)
         """
-        self.config_path = Path(config_path)
+        self.env = env
+        self.default_config_path = Path(config_path)
+        self.config_path = self._resolve_config_path(config_path, env)
         self.config = self._load_config()
+    
+    @classmethod
+    def from_dict(cls, config_dict: dict, env: str = "production"):
+        """
+        Cria uma instância de AgentConfig a partir de um dicionário
+        
+        Args:
+            config_dict: Dicionário com as configurações
+            env: Ambiente (padrão: production)
+            
+        Returns:
+            Instância de AgentConfig
+        """
+        instance = cls.__new__(cls)
+        instance.env = env
+        instance.default_config_path = None
+        instance.config_path = None
+        instance.config = config_dict
+        return instance
+    
+    def _resolve_config_path(self, default_path: str, env: str) -> Path:
+        """
+        Resolve o caminho do arquivo de configuração baseado no ambiente
+        
+        Args:
+            default_path: Caminho padrão do config
+            env: Ambiente (development, staging, production)
+            
+        Returns:
+            Path para o arquivo de configuração apropriado
+        """
+        # Para development, usa o arquivo padrão
+        if env == "development":
+            return Path(default_path)
+        
+        # Para staging e production, tenta usar arquivo específico
+        base_path = Path(default_path)
+        env_config_path = base_path.parent / f"{base_path.stem}.{env}{base_path.suffix}"
+        
+        # Se o arquivo específico existir, usa ele
+        if env_config_path.exists():
+            logger.info(f"📋 Usando configuração específica: {env_config_path}")
+            return env_config_path
+        
+        # Caso contrário, usa o padrão e avisa
+        logger.warning(
+            f"⚠️ Arquivo {env_config_path} não encontrado. "
+            f"Usando configuração padrão: {base_path}"
+        )
+        return Path(default_path)
     
     def _load_config(self) -> dict:
         """Carrega o arquivo de configuração JSON"""

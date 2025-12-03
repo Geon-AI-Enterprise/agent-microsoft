@@ -3,3 +3,8 @@ azure-identity
 azure-core
 python-dotenv
 pyaudio
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+supabase
