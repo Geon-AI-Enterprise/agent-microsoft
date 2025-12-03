@@ -13,10 +13,18 @@ from typing import Optional
 from azure.ai.voicelive.aio import VoiceLiveConnection
 
 # Audio Library (Conditional Import)
+import os
 try:
-    import pyaudio
-    AUDIO_AVAILABLE = True
+    # Só tenta importar PyAudio em ambiente de desenvolvimento
+    if os.getenv("APP_ENV", "development") == "development":
+        import pyaudio
+        AUDIO_AVAILABLE = True
+    else:
+        AUDIO_AVAILABLE = False
 except ImportError:
+    AUDIO_AVAILABLE = False
+except Exception as e:
+    logging.warning(f"⚠️ Erro ao importar PyAudio: {e}")
     AUDIO_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
