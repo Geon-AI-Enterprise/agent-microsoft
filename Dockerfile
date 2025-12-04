@@ -23,12 +23,13 @@ WORKDIR /app
 FROM base as dependencies
 
 # Instala TODAS as dependências do sistema necessárias para compilar pacotes nativos (PyAudio)
-# Inclui portaudio19-dev, gcc, python3-dev e libasound2-dev
+# Inclui portaudio19-dev, gcc, python3-dev, libasound2-dev e curl
 RUN apt-get update && apt-get install -y --no-install-recommends \
     portaudio19-dev \
     gcc \
     python3-dev \
     libasound2-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copia apenas requirements primeiro (cache do Docker)
@@ -44,6 +45,7 @@ FROM base as application
 # Copia dependências instaladas
 COPY --from=dependencies /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=dependencies /usr/local/bin /usr/local/bin
+COPY --from=dependencies /usr/bin/curl /usr/bin/curl
 
 # Copia código da aplicação
 COPY src/ ./src/
@@ -61,8 +63,8 @@ USER appuser
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import requests, os; port = os.getenv('PORT', '8000'); requests.get(f'http://localhost:{port}/health')" || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
 # Comando padrão
 CMD ["python", "-m", "src.main"]
