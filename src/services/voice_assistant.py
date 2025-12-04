@@ -96,6 +96,24 @@ class VoiceAssistantWorker:
     async def _send_initial_greeting(self):
         """Envia a saudação após um breve delay, permitindo que o loop principal inicie"""
         try:
+            # Pequeno delay para garantir que a conexão está estável
+            await asyncio.sleep(0.5)
+            
+            logger.info("👋 Disparando saudação inicial (Instrução Direta)...")
+            
+            # CORREÇÃO: Usamos apenas response.create. 
+            # Removemos o 'conversation.item.create' que causava o TypeError.
+            # Isso obriga o modelo a gerar áudio imediatamente baseado nas instruções.
+            await self.connection.response.create(
+                response={
+                    "instructions": "Diga a saudação inicial definida nas suas instruções agora. Seja amigável."
+                }
+            )
+        except Exception as e:
+            # Log de aviso, mas não derruba a aplicação
+            logger.warning(f"⚠️ Saudação inicial não pôde ser enviada: {e}")
+        """Envia a saudação após um breve delay, permitindo que o loop principal inicie"""
+        try:
             # Pequeno delay para garantir que _process_events já pegou o controle
             await asyncio.sleep(0.5)
             
