@@ -57,12 +57,19 @@ app = FastAPI(title="Azure VoiceLive Agent", lifespan=lifespan)
 @app.get("/health")
 async def health_check():
     """Health Check para monitoramento"""
-    status = "connected" if worker.connection else "initializing"
+    # Em desenvolvimento, verifica conexão do worker global
+    # Em staging/production, retorna 'ready' pois workers são criados por sessão WebSocket
+    if settings.is_development():
+        status = "connected" if worker.connection else "initializing"
+    else:
+        # Staging/Production: servidor está pronto para receber conexões WebSocket
+        status = "ready"
+    
     return {
         "status": "ok",
         "env": settings.APP_ENV,
         "worker_status": status,
-        "voice_model": worker.agent_config.voice
+        "voice_model": agent_config.voice
     }
 
 
