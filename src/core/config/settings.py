@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     MODEL_TEMPERATURE: float = Field(0.6, env="MODEL_TEMPERATURE")
     # Nota: No código Python, o parâmetro é 'max_response_output_tokens'
     MAX_RESPONSE_OUTPUT_TOKENS: int = Field(400, env="MAX_RESPONSE_OUTPUT_TOKENS")
+    
+    # --- Configurações de Saudação e Proteção (v2.1) ---
+    GREETING_DELAY_SECONDS: float = Field(1.5, env="GREETING_DELAY_SECONDS")
+    GREETING_GRACE_PERIOD_SECONDS: float = Field(2.0, env="GREETING_GRACE_PERIOD_SECONDS")
+    VAD_DEBOUNCE_MS: int = Field(300, env="VAD_DEBOUNCE_MS")
 
     @field_validator('APP_ENV')
     @classmethod

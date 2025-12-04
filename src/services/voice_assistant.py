@@ -3,6 +3,12 @@ Voice Assistant Worker Service
 
 Core do Assistente: Gerencia Conexão, Sessão e Eventos do Azure VoiceLive.
 Adaptado para suportar telefonia (G.711 Mu-Law).
+
+Correções v2.1:
+- Removido código duplicado
+- Implementado grace period para proteção de saudação
+- Adicionado debouncing para eventos VAD
+- Melhorado logging e rastreamento de estados
 """
 
 import asyncio
@@ -44,9 +50,19 @@ class VoiceAssistantWorker:
         self.audio_output_handler = audio_output_handler
         self.interruption_handler = interruption_handler
         self._shutdown_event = asyncio.Event()
-        self.is_agent_speaking = False # <-- NOVO: Flag de estado
+        
+        # Sistema de Estados
+        self.is_agent_speaking = False
+        self._greeting_sent_at = None
+        self._last_vad_event = 0
+        
+        # Configurações de Proteção
+        self._grace_period_seconds = getattr(settings, 'GREETING_GRACE_PERIOD_SECONDS', 2.0)
+        self._vad_debounce_ms = getattr(settings, 'VAD_DEBOUNCE_MS', 300)
+        self._greeting_delay = getattr(settings, 'GREETING_DELAY_SECONDS', 1.5)
         
         logger.info(f"🚀 Worker inicializado | Env: {self.settings.APP_ENV} | Voz: {self.agent_config.voice}")
+        logger.debug(f"🛡️ Proteções: Grace={self._grace_period_seconds}s | Debounce={self._vad_debounce_ms}ms | Delay={self._greeting_delay}s")
 
     async def connect_and_run(self):
         """Loop principal de conexão"""
@@ -82,7 +98,7 @@ class VoiceAssistantWorker:
                 # 1. Configura Sessão (VAD Calibrado)
                 await self._configure_session()
 
-                # 2. Agenda a Saudação para rodar EM PARALELO
+                # 2. Agenda a Saudação para rodar EM PARALELO (com delay aumentado)
                 asyncio.create_task(self._send_initial_greeting())
                 
                 # 3. Inicia o processamento de eventos IMEDIATAMENTE
@@ -138,10 +154,10 @@ class VoiceAssistantWorker:
         logger.info(f"✅ Sessão configurada: VAD(t={vad_config.threshold}, s={vad_config.silence_duration_ms}ms) | Temp: {self.settings.MODEL_TEMPERATURE} | Max Tokens: {self.settings.MAX_RESPONSE_OUTPUT_TOKENS}")
 
     async def _send_initial_greeting(self):
-        """Envia a saudação após um breve delay, permitindo que o loop principal inicie"""
+        """Envia a saudação após delay configurável, permitindo estabilização da conexão"""
         try:
-            # Pequeno delay para garantir que a conexão está estável
-            await asyncio.sleep(0.5)
+            # Delay aumentado para garantir que a conexão está totalmente estável
+            await asyncio.sleep(self._greeting_delay)
             
             logger.info("👋 Disparando saudação inicial...")
             
@@ -151,21 +167,49 @@ class VoiceAssistantWorker:
                     "instructions": "O usuário atendeu o telefone. Diga sua saudação inicial definida nas suas instruções agora. Seja natural e aguarde a resposta do usuário."
                 }
             )
+            
+            # Marca o timestamp da saudação para grace period
+            self._greeting_sent_at = asyncio.get_event_loop().time()
+            logger.debug(f"⏱️ Grace period iniciado: {self._grace_period_seconds}s")
+            
         except Exception as e:
             logger.warning(f"⚠️ Saudação inicial não pôde ser enviada (pode ser ignorado se a chamada caiu): {e}")
 
-# Em src/services/voice_assistant.py, dentro da classe VoiceAssistantWorker
+    def _is_in_grace_period(self) -> bool:
+        """Verifica se ainda está no período de proteção após a saudação"""
+        if not self._greeting_sent_at:
+            return False
+        elapsed = asyncio.get_event_loop().time() - self._greeting_sent_at
+        return elapsed < self._grace_period_seconds
+
+    def _should_process_vad_event(self) -> bool:
+        """Debouncing para evitar processar eventos VAD repetitivos"""
+        now = asyncio.get_event_loop().time() * 1000  # em ms
+        if (now - self._last_vad_event) < self._vad_debounce_ms:
+            return False
+        self._last_vad_event = now
+        return True
 
     async def _process_events(self):
-        """Processa eventos recebidos do Azure com Barge-in Não-Bloqueante"""
+        """Processa eventos recebidos do Azure com Barge-in, Grace Period e Debouncing"""
         async for event in self.connection:
             if self._shutdown_event.is_set():
                 break
 
-            # Barge-in (Interrupção)
+            # ========== BARGE-IN (INTERRUPÇÃO) ==========
             if event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
                 
-                # --- CORREÇÃO: LÓGICA DE ESTADO ---
+                # Proteção 1: Grace Period após saudação
+                if self._is_in_grace_period():
+                    logger.debug("🛡️ Grace period ativo - ignorando detecção de fala (proteção de saudação)")
+                    continue
+                
+                # Proteção 2: Debouncing
+                if not self._should_process_vad_event():
+                    logger.debug("⏭️ Evento VAD ignorado (debouncing - muito próximo do anterior)")
+                    continue
+                
+                # Lógica de Barge-in
                 if self.is_agent_speaking:
                     logger.info("👤 Usuário falando: BARGE-IN DETECTADO! Interrompendo agente.")
                     
@@ -180,108 +224,56 @@ class VoiceAssistantWorker:
                     # 3. Cancela resposta no Azure - ASYNC/FIRE-AND-FORGET
                     asyncio.create_task(self._safe_cancel_response())
                     
-                    # !!! REMOVIDO: Não resetamos o estado aqui. 
-                    # self.is_agent_speaking = False # LINHA REMOVIDA
+                    # Reseta o estado
+                    self.is_agent_speaking = False
                     
                 else:
                     logger.debug("👤 Usuário falando: Turno normal (Agente estava em silêncio).")
-                # -------------------------------
 
+            # ========== ÁUDIO DO AGENTE ==========
             elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
-                # --- Rastreamento de estado quando o agente começa a falar ---
+                # Rastreamento de estado quando o agente começa a falar
                 if not self.is_agent_speaking:
                     self.is_agent_speaking = True
-                    logger.debug("🔊 Agente começou a falar (Setting state=True)")
-                # -----------------------------------------------------------------
+                    logger.debug("🔊 Agente começou a falar")
 
                 if self.audio_output_handler:
                     await self.audio_output_handler(event.delta)
                 elif self.audio_processor:
                     self.audio_processor.queue_audio(event.delta)
 
+            # ========== ERROS ==========
             elif event.type == ServerEventType.ERROR:
                 logger.error(f"❌ Erro Azure: {event.error.message}")
 
+            # ========== TRANSCRIÇÃO DO AGENTE ==========
             elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
                 logger.info(f"🤖 Agente: {event.transcript}")
                 
-                # --- Rastreamento de estado quando o agente termina de falar ---
+                # Rastreamento de estado quando o agente termina de falar
                 self.is_agent_speaking = False
-                logger.debug("🔇 Agente terminou de falar (Setting state=False)")
-                # -------------------------------------------------------------------
+                logger.debug("🔇 Agente terminou de falar")
 
+            # ========== TRANSCRIÇÃO DO USUÁRIO ==========
             elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
                 logger.info(f"👤 Usuário: {event.transcript}")
             
+            # ========== DETECÇÃO DE SILÊNCIO ==========
             elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
-                logger.info("🛑 Detecção de silêncio (VAD Stopped) - Processando resposta...")
-        """Processa eventos recebidos do Azure com Barge-in Não-Bloqueante"""
-        async for event in self.connection:
-            if self._shutdown_event.is_set():
-                break
-
-            # Barge-in (Interrupção)
-            if event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
-                
-                # --- NOVO: LÓGICA DE ESTADO ---
-                if self.is_agent_speaking:
-                    logger.info("👤 Usuário falando: BARGE-IN DETECTADO! Interrompendo agente.")
-                    
-                    # 1. Limpa áudio local (Dev)
-                    if self.audio_processor:
-                        self.audio_processor.skip_pending_audio()
-                    
-                    # 2. Limpa buffer do Twilio (Prod) - ASYNC/FIRE-AND-FORGET
-                    if self.interruption_handler:
-                        asyncio.create_task(self.interruption_handler())
-
-                    # 3. Cancela resposta no Azure - ASYNC/FIRE-AND-FORGET
-                    asyncio.create_task(self._safe_cancel_response())
-                    
-                    # Reseta o estado para garantir que a próxima fala do agente será uma nova resposta
-                    self.is_agent_speaking = False 
-                else:
-                    logger.debug("👤 Usuário falando: Turno normal (Agente estava em silêncio).")
-                # -------------------------------
-
-            elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
-                # --- NOVO: Rastreamento de estado quando o agente começa a falar ---
-                if not self.is_agent_speaking:
-                    self.is_agent_speaking = True
-                    logger.debug("🔊 Agente começou a falar (Setting state=True)")
-                # -----------------------------------------------------------------
-
-                if self.audio_output_handler:
-                    await self.audio_output_handler(event.delta)
-                elif self.audio_processor:
-                    self.audio_processor.queue_audio(event.delta)
-
-            elif event.type == ServerEventType.ERROR:
-                logger.error(f"❌ Erro Azure: {event.error.message}")
-
-            elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
-                logger.info(f"🤖 Agente: {event.transcript}")
-                
-                # --- NOVO: Rastreamento de estado quando o agente termina de falar ---
-                self.is_agent_speaking = False
-                logger.debug("🔇 Agente terminou de falar (Setting state=False)")
-                # -------------------------------------------------------------------
-
-            elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
-                logger.info(f"👤 Usuário: {event.transcript}")
-            
-            elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
-                logger.info("🛑 Detecção de silêncio (VAD Stopped) - Processando resposta...")
+                logger.info("🛑 Silêncio detectado (VAD) - Processando resposta...")
 
     async def _safe_cancel_response(self):
         """Helper para cancelar resposta sem crashar em caso de erro"""
         try:
             if self.connection:
                 await self.connection.response.cancel()
+                logger.debug("✂️ Resposta do Azure cancelada com sucesso")
         except Exception as e:
-            logger.debug(f"Info: Cancelamento de resposta falhou/ignorado: {e}")
+            logger.debug(f"ℹ️ Cancelamento de resposta falhou/ignorado: {e}")
 
     def shutdown(self):
+        """Encerra o worker gracefully"""
+        logger.info("🛑 Encerrando Voice Assistant Worker...")
         self._shutdown_event.set()
         if self.audio_processor:
             self.audio_processor.shutdown()
