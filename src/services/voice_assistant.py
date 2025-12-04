@@ -92,7 +92,7 @@ class VoiceAssistantWorker:
             logger.critical(f"❌ Erro fatal no Worker: {e}", exc_info=show_exc_info)
 
     async def _configure_session(self):
-        """Envia configurações para o Azure com VAD calibrado para Telefonia"""
+        """Envia configurações para o Azure lendo das variáveis de ambiente."""
         
         # 1. Recupera Configuração de Codec
         audio_config = self.agent_config.config.get('audio', {})
@@ -114,14 +114,14 @@ class VoiceAssistantWorker:
 
         logger.info(f"🎛️ Configurando Áudio Sessão: Input={input_fmt} | Output={output_fmt}")
 
-        # 2. DEFINIÇÃO DE VAD (Calibrado para Telefonia Real)
+        # 2. DEFINIÇÃO DE VAD (Lendo das Variáveis de Ambiente)
         vad_config = ServerVad(
             threshold=self.settings.VAD_THRESHOLD,
             prefix_padding_ms=self.settings.VAD_PREFIX_PADDING_MS,
             silence_duration_ms=self.settings.VAD_SILENCE_DURATION_MS
         )
         
-        # 3. Configuração da Sessão
+        # 3. Configuração da Sessão (Lendo das Variáveis de Ambiente)
         session_config = RequestSession(
             modalities=[Modality.TEXT, Modality.AUDIO],
             instructions=self.agent_config.instructions,
@@ -134,7 +134,7 @@ class VoiceAssistantWorker:
         )
         
         await self.connection.session.update(session=session_config)
-        logger.info(f"✅ Sessão configurada: VAD(t={vad_config.threshold}, s={vad_config.silence_duration_ms}ms)")
+        logger.info(f"✅ Sessão configurada: VAD(t={vad_config.threshold}, s={vad_config.silence_duration_ms}ms) | Temp: {self.settings.MODEL_TEMPERATURE} | Max Tokens: {self.settings.MAX_RESPONSE_OUTPUT_TOKENS}")
 
     async def _send_initial_greeting(self):
         """Envia a saudação após um breve delay, permitindo que o loop principal inicie"""
