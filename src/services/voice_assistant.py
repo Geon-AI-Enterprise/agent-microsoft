@@ -116,9 +116,9 @@ class VoiceAssistantWorker:
 
         # 2. DEFINIÇÃO DE VAD (Calibrado para Telefonia Real)
         vad_config = ServerVad(
-            threshold=0.5,              # Sensibilidade média (Phone Standard)
-            prefix_padding_ms=300,      # Buffer de segurança maior
-            silence_duration_ms=500     # Aguarda 0.5s de silêncio antes de responder
+            threshold=self.settings.VAD_THRESHOLD,
+            prefix_padding_ms=self.settings.VAD_PREFIX_PADDING_MS,
+            silence_duration_ms=self.settings.VAD_SILENCE_DURATION_MS
         )
         
         # 3. Configuração da Sessão
@@ -129,8 +129,8 @@ class VoiceAssistantWorker:
             input_audio_format=input_fmt,
             output_audio_format=output_fmt,
             turn_detection=vad_config,
-            temperature=0.6,
-            max_response_output_tokens=400 
+            temperature=self.settings.MODEL_TEMPERATURE,
+            max_response_output_tokens=self.settings.MAX_RESPONSE_OUTPUT_TOKENS 
         )
         
         await self.connection.session.update(session=session_config)

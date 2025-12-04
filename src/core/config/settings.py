@@ -26,6 +26,16 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_ROLE_KEY: str
 
+    # --- Configurações de VAD (Detecção de Atividade de Voz) ---
+    VAD_THRESHOLD: float = Field(0.5, env="VAD_THRESHOLD")
+    VAD_PREFIX_PADDING_MS: int = Field(300, env="VAD_PREFIX_PADDING_MS")
+    VAD_SILENCE_DURATION_MS: int = Field(500, env="VAD_SILENCE_DURATION_MS")
+    
+    # --- Configurações de Modelo (LLM) ---
+    MODEL_TEMPERATURE: float = Field(0.6, env="MODEL_TEMPERATURE")
+    # Nota: No código Python, o parâmetro é 'max_response_output_tokens'
+    MAX_RESPONSE_OUTPUT_TOKENS: int = Field(400, env="MAX_RESPONSE_OUTPUT_TOKENS")
+
     @field_validator('APP_ENV')
     @classmethod
     def validate_environment(cls, v: str) -> str:
