@@ -175,13 +175,16 @@ class VoiceAssistantWorker:
 
             elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
                 logger.info(f"🤖 Agente: {event.transcript}")
-            
+
             elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
                 logger.info(f"👤 Usuário: {event.transcript}")
             
             # (Opcional) Captura sessão criada para debug
             elif event.type == ServerEventType.SESSION_CREATED:
                 logger.debug(f"ℹ️ Sessão criada: {event.session.id}")
+
+            elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
+                logger.info("🛑 Detecção de silêncio (VAD Stopped) - Processando...")
 
     def shutdown(self):
         self._shutdown_event.set()
