@@ -52,9 +52,9 @@ class Settings(BaseSettings):
         if self.is_development():
             return "DEBUG"
         elif self.is_staging():
-            return "INFO"
+            return "DEBUG"
         else:  # production
-            return "WARNING"
+            return "INFO"
 
     class Config:
         # Em produção, o arquivo .env será ignorado se não existir, 

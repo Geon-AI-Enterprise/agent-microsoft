@@ -183,17 +183,20 @@ def configure_third_party_loggers(environment: str):
     Reduz verbosidade em staging/production
     """
     is_dev = environment == 'development'
+    is_staging = environment == 'staging'
     
     # Azure SDK - muito verbose em DEBUG
     logging.getLogger('azure').setLevel(logging.WARNING)
     logging.getLogger('azure.core').setLevel(logging.WARNING)
     
-    if is_dev:
+    if is_dev or is_staging:
         # Em development, permite INFO do VoiceLive para debug
-        logging.getLogger('azure.ai.voicelive').setLevel(logging.INFO)
+        logging.getLogger('uvicorn').setLevel(logging.INFO)
+        logging.getLogger('uvicorn.access').setLevel(logging.INFO) # <--- CRÍTICO: Mostra os requests HTTP
     else:
         # Em staging/production, apenas WARNING+
-        logging.getLogger('azure.ai.voicelive').setLevel(logging.WARNING)
+        logging.getLogger('uvicorn').setLevel(logging.WARNING)
+        logging.getLogger('uvicorn.access').setLevel(logging.ERROR)
     
     # Uvicorn - logs de acesso muito verbosos
     if is_dev:
