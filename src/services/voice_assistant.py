@@ -44,6 +44,7 @@ class VoiceAssistantWorker:
         self.audio_output_handler = audio_output_handler
         self.interruption_handler = interruption_handler
         self._shutdown_event = asyncio.Event()
+        self.is_agent_speaking = False # <-- NOVO: Flag de estado
         
         logger.info(f"🚀 Worker inicializado | Env: {self.settings.APP_ENV} | Voz: {self.agent_config.voice}")
 
@@ -161,20 +162,35 @@ class VoiceAssistantWorker:
 
             # Barge-in (Interrupção)
             if event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
-                logger.info("👤 Usuário falando (Barge-in)...")
                 
-                # 1. Limpa áudio local (Dev)
-                if self.audio_processor:
-                    self.audio_processor.skip_pending_audio()
-                
-                # 2. Limpa buffer do Twilio (Prod) - ASYNC/FIRE-AND-FORGET
-                if self.interruption_handler:
-                    asyncio.create_task(self.interruption_handler())
+                # --- NOVO: LÓGICA DE ESTADO ---
+                if self.is_agent_speaking:
+                    logger.info("👤 Usuário falando: BARGE-IN DETECTADO! Interrompendo agente.")
+                    
+                    # 1. Limpa áudio local (Dev)
+                    if self.audio_processor:
+                        self.audio_processor.skip_pending_audio()
+                    
+                    # 2. Limpa buffer do Twilio (Prod) - ASYNC/FIRE-AND-FORGET
+                    if self.interruption_handler:
+                        asyncio.create_task(self.interruption_handler())
 
-                # 3. Cancela resposta no Azure - ASYNC/FIRE-AND-FORGET
-                asyncio.create_task(self._safe_cancel_response())
+                    # 3. Cancela resposta no Azure - ASYNC/FIRE-AND-FORGET
+                    asyncio.create_task(self._safe_cancel_response())
+                    
+                    # Reseta o estado para garantir que a próxima fala do agente será uma nova resposta
+                    self.is_agent_speaking = False 
+                else:
+                    logger.debug("👤 Usuário falando: Turno normal (Agente estava em silêncio).")
+                # -------------------------------
 
             elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
+                # --- NOVO: Rastreamento de estado quando o agente começa a falar ---
+                if not self.is_agent_speaking:
+                    self.is_agent_speaking = True
+                    logger.debug("🔊 Agente começou a falar (Setting state=True)")
+                # -----------------------------------------------------------------
+
                 if self.audio_output_handler:
                     await self.audio_output_handler(event.delta)
                 elif self.audio_processor:
@@ -185,6 +201,11 @@ class VoiceAssistantWorker:
 
             elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
                 logger.info(f"🤖 Agente: {event.transcript}")
+                
+                # --- NOVO: Rastreamento de estado quando o agente termina de falar ---
+                self.is_agent_speaking = False
+                logger.debug("🔇 Agente terminou de falar (Setting state=False)")
+                # -------------------------------------------------------------------
 
             elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
                 logger.info(f"👤 Usuário: {event.transcript}")
