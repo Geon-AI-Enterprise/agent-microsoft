@@ -56,12 +56,12 @@ USER appuser
 
 EXPOSE 8000
 
-# HEALTHCHECK NATIVO EM PYTHON (Mais robusto que curl)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+# HEALTHCHECK NATIVO EM PYTHON
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; import os; \
     port = os.getenv('PORT', '8000'); \
     try: \
-        urllib.request.urlopen(f'http://localhost:{port}/health').close(); \
+        urllib.request.urlopen(f'http://127.0.0.1:{port}/health').close(); \
     except Exception: exit(1)"
 
 CMD ["python", "-m", "src.main"]

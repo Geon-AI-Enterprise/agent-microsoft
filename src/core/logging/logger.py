@@ -180,6 +180,39 @@ def setup_logging(settings) -> logging.Logger:
 def configure_third_party_loggers(environment: str):
     """
     Configura níveis de log para bibliotecas terceiras
+    """
+    is_dev = environment == 'development'
+    is_staging = environment == 'staging'
+    
+    # 1. Silenciar logs de baixo nível de HTTP (Essencial para limpar o console)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('hpack').setLevel(logging.WARNING)
+    
+    # 2. Azure SDK
+    logging.getLogger('azure').setLevel(logging.WARNING)
+    logging.getLogger('azure.core').setLevel(logging.WARNING)
+    
+    # 3. Uvicorn (Servidor)
+    if is_dev or is_staging:
+        logging.getLogger('uvicorn').setLevel(logging.INFO)
+    else:
+        logging.getLogger('uvicorn').setLevel(logging.WARNING)
+        
+    # 4. Logs de Acesso HTTP (Health Check)
+    if is_dev:
+        logging.getLogger('uvicorn.access').setLevel(logging.WARNING) 
+    elif is_staging:
+        # Mantemos INFO em staging para ver o Health Check (200 OK) passando!
+        logging.getLogger('uvicorn.access').setLevel(logging.INFO) 
+    else:
+        logging.getLogger('uvicorn.access').setLevel(logging.ERROR)
+    
+    # 5. FastAPI
+    if not is_dev:
+        logging.getLogger('fastapi').setLevel(logging.WARNING)
+    """
+    Configura níveis de log para bibliotecas terceiras
     Reduz verbosidade em staging/production
     """
     is_dev = environment == 'development'
