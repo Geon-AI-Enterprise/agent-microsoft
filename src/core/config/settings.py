@@ -52,7 +52,7 @@ class Settings(BaseSettings):
         if self.is_development():
             return "DEBUG"
         elif self.is_staging():
-            return "DEBUG"
+            return "INFO"
         else:  # production
             return "INFO"
 
