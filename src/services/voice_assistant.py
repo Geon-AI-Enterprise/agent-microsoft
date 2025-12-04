@@ -4,11 +4,13 @@ Voice Assistant Worker Service
 Core do Assistente: Gerencia Conexão, Sessão e Eventos do Azure VoiceLive.
 Adaptado para suportar telefonia (G.711 Mu-Law).
 
-Correções v2.1:
+Correções v2.2:
 - Removido código duplicado
 - Implementado grace period para proteção de saudação
 - Adicionado debouncing para eventos VAD
 - Melhorado logging e rastreamento de estados
+- NOVO: Limpeza de input_audio_buffer no barge-in
+- NOVO: Modo saudação para prevenir auto-resposta
 """
 
 import asyncio
@@ -54,6 +56,7 @@ class VoiceAssistantWorker:
         # Sistema de Estados
         self.is_agent_speaking = False
         self._greeting_sent_at = None
+        self._is_greeting_mode = False  # NOVO: Flag para modo saudação
         self._last_vad_event = 0
         
         # Configurações de Proteção
@@ -154,9 +157,14 @@ class VoiceAssistantWorker:
         logger.info(f"✅ Sessão configurada: VAD(t={vad_config.threshold}, s={vad_config.silence_duration_ms}ms) | Temp: {self.settings.MODEL_TEMPERATURE} | Max Tokens: {self.settings.MAX_RESPONSE_OUTPUT_TOKENS}")
 
     async def _send_initial_greeting(self):
-        """Envia a saudação após delay configurável, permitindo estabilização da conexão"""
+        """Envia a saudação após delay configurável, com proteção contra auto-resposta"""
         try:
-            # Delay aumentado para garantir que a conexão está totalmente estável
+            # CORREÇÃO: Ativa proteções ANTES de enviar a saudação
+            self._greeting_sent_at = asyncio.get_event_loop().time()
+            self._is_greeting_mode = True
+            logger.debug(f"🛡️ Modo saudação ativado (grace={self._grace_period_seconds}s)")
+            
+            # Delay para estabilização da conexão
             await asyncio.sleep(self._greeting_delay)
             
             logger.info("👋 Disparando saudação inicial...")
@@ -168,12 +176,9 @@ class VoiceAssistantWorker:
                 }
             )
             
-            # Marca o timestamp da saudação para grace period
-            self._greeting_sent_at = asyncio.get_event_loop().time()
-            logger.debug(f"⏱️ Grace period iniciado: {self._grace_period_seconds}s")
-            
         except Exception as e:
             logger.warning(f"⚠️ Saudação inicial não pôde ser enviada (pode ser ignorado se a chamada caiu): {e}")
+            self._is_greeting_mode = False  # Desativa em caso de erro
 
     def _is_in_grace_period(self) -> bool:
         """Verifica se ainda está no período de proteção após a saudação"""
@@ -221,8 +226,8 @@ class VoiceAssistantWorker:
                     if self.interruption_handler:
                         asyncio.create_task(self.interruption_handler())
 
-                    # 3. Cancela resposta no Azure - ASYNC/FIRE-AND-FORGET
-                    asyncio.create_task(self._safe_cancel_response())
+                    # 3. CORREÇÃO: Cancela resposta E limpa buffer de entrada
+                    asyncio.create_task(self._cancel_and_clear())
                     
                     # Reseta o estado
                     self.is_agent_speaking = False
@@ -253,6 +258,11 @@ class VoiceAssistantWorker:
                 # Rastreamento de estado quando o agente termina de falar
                 self.is_agent_speaking = False
                 logger.debug("🔇 Agente terminou de falar")
+                
+                # CORREÇÃO: Finaliza modo saudação após primeira transcrição
+                if self._is_greeting_mode:
+                    self._is_greeting_mode = False
+                    logger.debug("✅ Modo saudação finalizado")
 
             # ========== TRANSCRIÇÃO DO USUÁRIO ==========
             elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
@@ -260,10 +270,25 @@ class VoiceAssistantWorker:
             
             # ========== DETECÇÃO DE SILÊNCIO ==========
             elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
+                # CORREÇÃO: Ignora silêncio durante modo saudação
+                if self._is_greeting_mode:
+                    logger.debug("🚫 Modo saudação - ignorando detecção de silêncio")
+                    continue
+                
                 logger.info("🛑 Silêncio detectado (VAD) - Processando resposta...")
 
+    async def _cancel_and_clear(self):
+        """NOVO: Cancela resposta E limpa buffer de entrada (barge-in completo)"""
+        try:
+            if self.connection:
+                await self.connection.response.cancel()
+                await self.connection.input_audio_buffer.clear()
+                logger.info("✂️ Resposta e buffer de entrada cancelados")
+        except Exception as e:
+            logger.debug(f"ℹ️ Cancelamento falhou/ignorado: {e}")
+
     async def _safe_cancel_response(self):
-        """Helper para cancelar resposta sem crashar em caso de erro"""
+        """Helper para cancelar resposta sem crashar em caso de erro (DEPRECATED - usar _cancel_and_clear)"""
         try:
             if self.connection:
                 await self.connection.response.cancel()
