@@ -78,50 +78,28 @@ class VoiceAssistantWorker:
                 else:
                     logger.info(f"ℹ️ Modo Headless/Telefonia: Áudio Local Desativado (Format: {input_fmt_str})")
 
-                # 1. Configura Sessão (Rápido)
+                # 1. Configura Sessão (VAD Calibrado)
                 await self._configure_session()
 
                 # 2. Agenda a Saudação para rodar EM PARALELO
-                # Não usamos await aqui! Isso permite que o código desça para o _process_events
                 asyncio.create_task(self._send_initial_greeting())
                 
                 # 3. Inicia o processamento de eventos IMEDIATAMENTE
-                # Isso mantém o WebSocket vivo e processando os ACKs do servidor
                 await self._process_events()
 
         except Exception as e:
             show_exc_info = self.settings.is_development() or self.settings.is_staging()
             logger.critical(f"❌ Erro fatal no Worker: {e}", exc_info=show_exc_info)
 
-    async def _send_initial_greeting(self):
-        """Envia a saudação após um breve delay, permitindo que o loop principal inicie"""
-        try:
-            # Pequeno delay para garantir que a conexão está estável e o _process_events já iniciou
-            await asyncio.sleep(0.5)
-            
-            logger.info("👋 Disparando saudação inicial...")
-            
-            # CORREÇÃO: Usamos apenas response.create com instruções.
-            # Isso força o modelo a falar sem precisar injetar uma mensagem falsa de 'user'.
-            await self.connection.response.create(
-                response={
-                    "instructions": "O usuário atendeu o telefone. Diga sua saudação inicial definida nas suas instruções agora. Seja natural e aguarde a resposta do usuário."
-                }
-            )
-        except Exception as e:
-            # Catch genérico para evitar que um erro de saudação derrube a chamada inteira
-            # e para tratar o caso de 'closing transport' silenciosamente se a chamada caiu antes
-            logger.warning(f"⚠️ Saudação inicial não pôde ser enviada (pode ser ignorado se a chamada caiu): {e}")
-        
     async def _configure_session(self):
-        """Envia configurações para o Azure com suporte a Codecs"""
+        """Envia configurações para o Azure com VAD calibrado para Telefonia"""
         
-        # 1. Mapeamento de Formatos (Mantemos a lógica de correção do G711)
+        # 1. Recupera Configuração de Codec
         audio_config = self.agent_config.config.get('audio', {})
-        
         input_fmt_str = str(audio_config.get('input_format', 'PCM16')).upper()
         output_fmt_str = str(audio_config.get('output_format', 'PCM16')).upper()
 
+        # Mapeamento Seguro de Formatos
         try:
             input_fmt = getattr(InputAudioFormat, input_fmt_str)
         except AttributeError:
@@ -136,60 +114,14 @@ class VoiceAssistantWorker:
 
         logger.info(f"🎛️ Configurando Áudio Sessão: Input={input_fmt} | Output={output_fmt}")
 
-        # 2. DEFINIÇÃO HARDCODED DE VAD (Performance Tuning)
-        # Substituímos a leitura do config por valores otimizados para produção
+        # 2. DEFINIÇÃO DE VAD (Calibrado para Telefonia Real)
         vad_config = ServerVad(
-            threshold=0.73,              # Sensibilidade calibrada para evitar ruído de linha
-            prefix_padding_ms=200,      # Buffer curto para menor latência
-            silence_duration_ms=250     # Detecção rápida de fim de fala
+            threshold=0.5,              # Sensibilidade média (Phone Standard)
+            prefix_padding_ms=300,      # Buffer de segurança maior
+            silence_duration_ms=500     # Aguarda 0.5s de silêncio antes de responder
         )
         
         # 3. Configuração da Sessão
-        session_config = RequestSession(
-            modalities=[Modality.TEXT, Modality.AUDIO],
-            instructions=self.agent_config.instructions, # Instruções continuam vindo do Banco
-            voice=AzureStandardVoice(name=self.agent_config.voice), # Voz continua vindo do Banco
-            input_audio_format=input_fmt,
-            output_audio_format=output_fmt,
-            turn_detection=vad_config,                   # Usando VAD Hardcoded
-            temperature=0.6,                             # Hardcoded: Mais determinístico e rápido
-            max_response_output_tokens=300               # Hardcoded: Respostas mais curtas e rápidas
-        )
-        
-        await self.connection.session.update(session=session_config)
-        logger.info("✅ Sessão configurada com VAD e Tokens otimizados (Hardcoded)")
-        """Envia configurações para o Azure com suporte a Codecs"""
-        
-        # 1. Recupera Configuração
-        audio_config = self.agent_config.config.get('audio', {})
-        
-        # 2. Sanitização (.upper() é CRÍTICO aqui)
-        # O banco pode retornar 'g711_ulaw', mas o Enum exige 'G711_ULAW'
-        input_fmt_str = str(audio_config.get('input_format', 'PCM16')).upper()
-        output_fmt_str = str(audio_config.get('output_format', 'PCM16')).upper()
-
-        # 3. Mapeamento Seguro
-        # Se falhar o getattr, usamos PCM16 e LOGAMOS O AVISO
-        try:
-            input_fmt = getattr(InputAudioFormat, input_fmt_str)
-        except AttributeError:
-            logger.warning(f"⚠️ Formato Input '{input_fmt_str}' desconhecido/inválido. Usando PCM16.")
-            input_fmt = InputAudioFormat.PCM16
-
-        try:
-            output_fmt = getattr(OutputAudioFormat, output_fmt_str)
-        except AttributeError:
-            logger.warning(f"⚠️ Formato Output '{output_fmt_str}' desconhecido/inválido. Usando PCM16.")
-            output_fmt = OutputAudioFormat.PCM16
-
-        logger.info(f"🎛️ Configurando Áudio Sessão: Input={input_fmt} | Output={output_fmt}")
-
-        vad_config = ServerVad(
-            threshold=self.agent_config.config['turn_detection']['threshold'],
-            prefix_padding_ms=self.agent_config.config['turn_detection']['prefix_padding_ms'],
-            silence_duration_ms=self.agent_config.config['turn_detection']['silence_duration_ms']
-        )
-        
         session_config = RequestSession(
             modalities=[Modality.TEXT, Modality.AUDIO],
             instructions=self.agent_config.instructions,
@@ -197,15 +129,32 @@ class VoiceAssistantWorker:
             input_audio_format=input_fmt,
             output_audio_format=output_fmt,
             turn_detection=vad_config,
-            temperature=self.agent_config.temperature,
-            max_response_output_tokens=self.agent_config.max_tokens
+            temperature=0.6,
+            max_response_output_tokens=400 
         )
         
         await self.connection.session.update(session=session_config)
-        logger.info("✅ Sessão atualizada no Azure com sucesso")
+        logger.info(f"✅ Sessão configurada: VAD(t={vad_config.threshold}, s={vad_config.silence_duration_ms}ms)")
+
+    async def _send_initial_greeting(self):
+        """Envia a saudação após um breve delay, permitindo que o loop principal inicie"""
+        try:
+            # Pequeno delay para garantir que a conexão está estável
+            await asyncio.sleep(0.5)
+            
+            logger.info("👋 Disparando saudação inicial...")
+            
+            # Força o modelo a falar com instructions
+            await self.connection.response.create(
+                response={
+                    "instructions": "O usuário atendeu o telefone. Diga sua saudação inicial definida nas suas instruções agora. Seja natural e aguarde a resposta do usuário."
+                }
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Saudação inicial não pôde ser enviada (pode ser ignorado se a chamada caiu): {e}")
 
     async def _process_events(self):
-        """Processa eventos recebidos do Azure"""
+        """Processa eventos recebidos do Azure com Barge-in Não-Bloqueante"""
         async for event in self.connection:
             if self._shutdown_event.is_set():
                 break
@@ -213,13 +162,17 @@ class VoiceAssistantWorker:
             # Barge-in (Interrupção)
             if event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
                 logger.info("👤 Usuário falando (Barge-in)...")
+                
+                # 1. Limpa áudio local (Dev)
                 if self.audio_processor:
                     self.audio_processor.skip_pending_audio()
                 
-                await self.connection.response.cancel()
-                
+                # 2. Limpa buffer do Twilio (Prod) - ASYNC/FIRE-AND-FORGET
                 if self.interruption_handler:
-                    await self.interruption_handler()
+                    asyncio.create_task(self.interruption_handler())
+
+                # 3. Cancela resposta no Azure - ASYNC/FIRE-AND-FORGET
+                asyncio.create_task(self._safe_cancel_response())
 
             elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
                 if self.audio_output_handler:
@@ -236,12 +189,16 @@ class VoiceAssistantWorker:
             elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
                 logger.info(f"👤 Usuário: {event.transcript}")
             
-            # (Opcional) Captura sessão criada para debug
-            elif event.type == ServerEventType.SESSION_CREATED:
-                logger.debug(f"ℹ️ Sessão criada: {event.session.id}")
-
             elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
-                logger.info("🛑 Detecção de silêncio (VAD Stopped) - Processando...")
+                logger.info("🛑 Detecção de silêncio (VAD Stopped) - Processando resposta...")
+
+    async def _safe_cancel_response(self):
+        """Helper para cancelar resposta sem crashar em caso de erro"""
+        try:
+            if self.connection:
+                await self.connection.response.cancel()
+        except Exception as e:
+            logger.debug(f"Info: Cancelamento de resposta falhou/ignorado: {e}")
 
     def shutdown(self):
         self._shutdown_event.set()
