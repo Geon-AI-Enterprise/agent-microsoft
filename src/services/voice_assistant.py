@@ -84,14 +84,16 @@ class VoiceAssistantWorker:
                 await self._configure_session()
 
                 # --- SAUDAÇÃO INICIAL ---
-                # Dica: Em telefonia, às vezes é melhor esperar o usuário falar "Alô" 
-                # ou mandar uma mensagem inicial proativa.
                 logger.info("👋 Enviando instrução inicial de saudação...")
-                # await self.connection.response.create(
-                #     response={
-                #         "instructions": "Diga 'Alô' para iniciar."
-                #     }
-                # )
+                await self.connection.conversation.item.create(
+                    item={
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Atendi o telefone. Apresente-se."}]
+                    }
+                )
+
+                await self.connection.response.create()
                 
                 # Loop de Eventos
                 await self._process_events()
@@ -101,6 +103,50 @@ class VoiceAssistantWorker:
             logger.critical(f"❌ Erro fatal no Worker: {e}", exc_info=show_exc_info)
 
     async def _configure_session(self):
+        """Envia configurações para o Azure com suporte a Codecs"""
+        
+        # 1. Mapeamento de Formatos (Mantemos a lógica de correção do G711)
+        audio_config = self.agent_config.config.get('audio', {})
+        
+        input_fmt_str = str(audio_config.get('input_format', 'PCM16')).upper()
+        output_fmt_str = str(audio_config.get('output_format', 'PCM16')).upper()
+
+        try:
+            input_fmt = getattr(InputAudioFormat, input_fmt_str)
+        except AttributeError:
+            logger.warning(f"⚠️ Formato Input '{input_fmt_str}' inválido. Usando PCM16.")
+            input_fmt = InputAudioFormat.PCM16
+
+        try:
+            output_fmt = getattr(OutputAudioFormat, output_fmt_str)
+        except AttributeError:
+            logger.warning(f"⚠️ Formato Output '{output_fmt_str}' inválido. Usando PCM16.")
+            output_fmt = OutputAudioFormat.PCM16
+
+        logger.info(f"🎛️ Configurando Áudio Sessão: Input={input_fmt} | Output={output_fmt}")
+
+        # 2. DEFINIÇÃO HARDCODED DE VAD (Performance Tuning)
+        # Substituímos a leitura do config por valores otimizados para produção
+        vad_config = ServerVad(
+            threshold=0.7,              # Sensibilidade calibrada para evitar ruído de linha
+            prefix_padding_ms=200,      # Buffer curto para menor latência
+            silence_duration_ms=180     # Detecção rápida de fim de fala
+        )
+        
+        # 3. Configuração da Sessão
+        session_config = RequestSession(
+            modalities=[Modality.TEXT, Modality.AUDIO],
+            instructions=self.agent_config.instructions, # Instruções continuam vindo do Banco
+            voice=AzureStandardVoice(name=self.agent_config.voice), # Voz continua vindo do Banco
+            input_audio_format=input_fmt,
+            output_audio_format=output_fmt,
+            turn_detection=vad_config,                   # Usando VAD Hardcoded
+            temperature=0.6,                             # Hardcoded: Mais determinístico e rápido
+            max_response_output_tokens=300               # Hardcoded: Respostas mais curtas e rápidas
+        )
+        
+        await self.connection.session.update(session=session_config)
+        logger.info("✅ Sessão configurada com VAD e Tokens otimizados (Hardcoded)")
         """Envia configurações para o Azure com suporte a Codecs"""
         
         # 1. Recupera Configuração
