@@ -83,6 +83,9 @@ class VoiceAssistantWorker:
                 # Configura Sessão
                 await self._configure_session()
 
+                logger.info("⏳ Aguardando estabilização da conexão...")
+                await asyncio.sleep(3.0)
+
                 # --- SAUDAÇÃO INICIAL ---
                 logger.info("👋 Enviando instrução inicial de saudação...")
                 await self.connection.conversation.item.create(
