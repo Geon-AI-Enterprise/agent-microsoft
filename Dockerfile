@@ -58,14 +58,6 @@ EXPOSE 8000
 
 # HEALTHCHECK NATIVO EM PYTHON
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request, os, sys; \
-    port = os.getenv('PORT', '8000'); \
-    url = f'http://127.0.0.1:{port}/health'; \
-    try: \
-        urllib.request.urlopen(url).close(); \
-    except Exception as e: \
-        with open('/proc/1/fd/1', 'w') as main_log: \
-            main_log.write(f'❌ DOCKER HEALTHCHECK FALHOU ao tentar {url}: {e}\n'); \
-        sys.exit(1)"
+    CMD ["python", "src/healthcheck.py"]
 
 CMD ["python", "-m", "src.main"]
