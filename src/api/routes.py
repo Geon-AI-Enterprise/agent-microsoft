@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # Carrega configuração do arquivo (desenvolvimento local)
-# Na Fase 3, cada conexão WebSocket carregará sua própria config do Supabase
 agent_config = AgentConfig("config/agent_config.json", env=settings.APP_ENV)
 
 # Worker instance com config injetada
@@ -57,12 +56,9 @@ app = FastAPI(title="Azure VoiceLive Agent", lifespan=lifespan)
 @app.get("/health")
 async def health_check():
     """Health Check para monitoramento"""
-    # Em desenvolvimento, verifica conexão do worker global
-    # Em staging/production, retorna 'ready' pois workers são criados por sessão WebSocket
     if settings.is_development():
         status = "connected" if worker.connection else "initializing"
     else:
-        # Staging/Production: servidor está pronto para receber conexões WebSocket
         status = "ready"
     
     return {
@@ -85,16 +81,6 @@ async def root():
 async def audio_stream(websocket: WebSocket, sip_number: str):
     """
     Endpoint WebSocket para streaming de áudio multi-tenant.
-    
-    Args:
-        sip_number: Número SIP do cliente (ex: '+5511999990001')
-        
-    Fluxo:
-        1. Busca configuração do cliente no Supabase
-        2. Cria Worker dedicado para esta conexão
-        3. Estabelece ponte bidirecional de áudio:
-           - Cliente → WebSocket → Azure (entrada)
-           - Azure → WebSocket → Cliente (saída)
     """
     await websocket.accept()
     logger.info(f"🔌 Nova conexão WebSocket: {sip_number}")
@@ -127,15 +113,25 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                 await websocket.send_text(encoded)
             except Exception as e:
                 logger.error(f"❌ Erro ao enviar áudio para cliente: {e}")
+
+        # 3. Callback para enviar sinal de interrupção (CORRIGIDO)
+        async def send_interruption_signal():
+            """Envia sinal para o cliente limpar o buffer de áudio imediatamente"""
+            try:
+                logger.info("🛑 Enviando sinal de CLEAR_BUFFER (Cale-se!)")
+                await websocket.send_text("CLEAR_BUFFER")
+            except Exception as e:
+                logger.error(f"❌ Erro ao enviar sinal de interrupção: {e}")
         
-        # 3. Cria Worker dedicado para esta sessão
+        # 4. Cria Worker dedicado para esta sessão
         session_worker = VoiceAssistantWorker(
             agent_config=client_config,
             settings=settings,
-            audio_output_handler=send_audio_to_client  # Roteamento de áudio customizado
+            audio_output_handler=send_audio_to_client,  # Roteamento de áudio
+            interruption_handler=send_interruption_signal # Roteamento de corte
         )
         
-        # 4. Inicia conexão Azure em background
+        # 5. Inicia conexão Azure em background
         session_task = asyncio.create_task(session_worker.connect_and_run())
         
         # Aguarda conexão ser estabelecida
@@ -148,7 +144,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
         
         logger.info(f"🎙️ Sessão de áudio iniciada para: {sip_number}")
         
-        # 5. Loop principal: recebe áudio do cliente e envia para Azure
+        # 6. Loop principal: recebe áudio do cliente e envia para Azure
         while True:
             try:
                 # Recebe áudio do cliente (base64 encoded PCM16)
@@ -173,7 +169,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
             pass
     
     finally:
-        # 6. Limpeza de recursos
+        # 7. Limpeza de recursos
         logger.info(f"🧹 Limpando recursos para: {sip_number}")
         
         if session_worker:

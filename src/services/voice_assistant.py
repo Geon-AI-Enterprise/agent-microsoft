@@ -32,21 +32,16 @@ logger = logging.getLogger(__name__)
 class VoiceAssistantWorker:
     """Core do Assistente: Gerencia Conexão, Sessão e Eventos"""
 
-    def __init__(self, agent_config: AgentConfig, settings=None, audio_output_handler=None):
+    def __init__(self, agent_config: AgentConfig, settings=None, audio_output_handler=None, interruption_handler=None):
         """
         Inicializa o Worker com configuração injetada
-        
-        Args:
-            agent_config: Configuração do agente (obrigatório)
-            settings: Settings da aplicação (opcional)
-            audio_output_handler: Callback assíncrono para enviar áudio de saída (opcional)
-                                 Assinatura: async def handler(audio_data: bytes)
         """
         self.settings = settings or get_settings()
-        self.agent_config = agent_config  # Config agora vem de fora (injetada)
+        self.agent_config = agent_config
         self.connection: Optional[VoiceLiveConnection] = None
         self.audio_processor: Optional[AudioProcessor] = None
-        self.audio_output_handler = audio_output_handler  # Para WebSocket na Fase 3
+        self.audio_output_handler = audio_output_handler  # Para WebSocket
+        self.interruption_handler = interruption_handler  # Para Interrupção (Barge-in)
         self._shutdown_event = asyncio.Event()
         
         logger.info(f"🚀 Worker inicializado | Env: {self.settings.APP_ENV} | Voz: {self.agent_config.voice}")
@@ -80,25 +75,32 @@ class VoiceAssistantWorker:
 
                 # Configura Sessão
                 await self._configure_session()
+
+                # --- SAUDAÇÃO INICIAL FORÇADA ---
+                logger.info("👋 Forçando saudação inicial...")
+                # Cria uma resposta imediata para quebrar o silêncio
+                await self.connection.response.create(
+                    response={
+                        "instructions": "Faça uma saudação curta e amigável apresentando-se como Lia."
+                    }
+                )
+                # --------------------------------
                 
                 # Loop de Eventos
                 await self._process_events()
 
         except Exception as e:
             logger.critical(f"❌ Erro fatal no Worker: {e}", exc_info=self.settings.is_development())
-            # Em produção, pode implementar lógica de retry aqui
 
     async def _configure_session(self):
         """Envia configurações do agent_config.json para o Azure"""
         
-        # Mapeia configurações do JSON para objetos do SDK
         vad_config = ServerVad(
             threshold=self.agent_config.config['turn_detection']['threshold'],
             prefix_padding_ms=self.agent_config.config['turn_detection']['prefix_padding_ms'],
             silence_duration_ms=self.agent_config.config['turn_detection']['silence_duration_ms']
         )
         
-        # Redução de ruído (mapeamento string -> objeto)
         noise_type = self.agent_config.config['audio']['noise_reduction']
         noise_config = AudioNoiseReduction(type=noise_type) if noise_type else None
 
@@ -124,37 +126,36 @@ class VoiceAssistantWorker:
             if self._shutdown_event.is_set():
                 break
 
-            # 1. Logs de Eventos (filtrados em Prod)
             if self.settings.is_development():
                 logger.debug(f"Evento: {event.type}")
 
             # 2. Usuário começou a falar (Barge-in Logic)
             if event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
-                logger.info("👤 Usuário detectado falando...")
+                logger.info("👤 Usuário detectado falando! Interrompendo...")
                 if self.audio_processor:
                     self.audio_processor.skip_pending_audio()
                 
-                # Cancela resposta atual (Barge-in)
+                # --- CORTE SECO ---
+                # 1. Cancela resposta atual na Azure
                 await self.connection.response.cancel()
+                
+                # 2. Envia sinal para limpar buffer do cliente
+                if self.interruption_handler:
+                    await self.interruption_handler()
+                # ------------------
 
-            # 3. Usuário parou de falar
             elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
                 logger.info("👤 Usuário parou de falar. Processando...")
 
-            # 4. Recebimento de Áudio
             elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
-                # Se temos handler externo (WebSocket), envia para lá
                 if self.audio_output_handler:
                     await self.audio_output_handler(event.delta)
-                # Caso contrário, usa AudioProcessor local (Dev)
                 elif self.audio_processor:
                     self.audio_processor.queue_audio(event.delta)
 
-            # 5. Erros do Servidor
             elif event.type == ServerEventType.ERROR:
                 logger.error(f"❌ Erro Azure: {event.error.message}")
 
-            # 6. Transcrição (Opcional - útil para logs)
             elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
                 logger.info(f"🤖 Agente disse: {event.transcript}")
             
