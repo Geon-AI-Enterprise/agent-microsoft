@@ -5,7 +5,7 @@ import pyaudio
 import sys
 
 # ================= CONFIGURAÇÕES =================
-SERVER_URL = "ws://localhost:8000/ws/audio/+5511999990003" 
+SERVER_URL = "wss://loginex-azure-voiceagent.1drwhc.easypanel.host/ws/audio/+5511999990001"
 # Certifique-se que este número existe no seu Supabase!
 
 # Configurações de Áudio (PCM16, 24kHz, Mono)
