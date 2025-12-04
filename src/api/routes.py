@@ -1,12 +1,12 @@
 """
-API Routes
+API Routes - Twilio Integration
 
-FastAPI endpoints para health check, informações básicas e WebSocket multi-tenant.
-Inclui sistema de Auto-Diagnóstico (Self-Test) no startup.
+Adaptado para processar eventos JSON do Twilio Media Streams.
 """
 
 import asyncio
 import base64
+import json
 import logging
 import socket
 from contextlib import asynccontextmanager
@@ -22,67 +22,44 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # ==============================================================================
-# DIAGNÓSTICO DE STARTUP (SELF-TEST)
+# DIAGNÓSTICO DE STARTUP (MANTIDO IGUAL)
 # ==============================================================================
 async def run_startup_diagnostics():
-    """
-    Executa bateria de testes de infraestrutura no startup.
-    Verifica Rede, DNS, Supabase e Configurações.
-    """
+    """Executa bateria de testes de infraestrutura no startup"""
     logger.info("🩺 INICIANDO DIAGNÓSTICO DE SELF-TEST...")
     errors = []
-
-    # 1. Teste de Resolução DNS e Conectividade Básica
+    
+    # 1. Teste de Rede
     try:
         host = "google.com"
-        # Tenta resolver DNS
-        addr = socket.gethostbyname(host)
-        # Tenta conectar na porta 80
         socket.create_connection((host, 80), timeout=2)
-        logger.info(f"✅ Rede OK: {host} -> {addr}")
+        logger.info(f"✅ Rede OK")
     except Exception as e:
-        msg = f"❌ FALHA DE REDE/DNS: Não foi possível conectar à internet ({e})"
-        logger.error(msg)
-        errors.append(msg)
+        logger.error(f"❌ FALHA DE REDE: {e}")
+        errors.append(str(e))
 
-    # 2. Teste de Conexão Supabase (Vital para Staging/Prod)
+    # 2. Teste Supabase
     if not settings.is_development():
         try:
-            logger.info(f"🔍 Testando conexão Supabase ({settings.SUPABASE_URL})...")
-            # Cliente temporário apenas para teste
             sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
-            
-            # Tenta uma query leve para verificar acesso
-            # Verifica se tabela de números existe (query head)
             sb.table('client_sip_numbers').select("sip_number", count="exact").limit(1).execute()
-            
-            logger.info(f"✅ Supabase OK: Conexão estabelecida")
+            logger.info(f"✅ Supabase OK")
         except Exception as e:
-            msg = f"❌ FALHA SUPABASE: Não foi possível conectar ao banco ({e})"
-            logger.error(msg)
-            errors.append(msg)
-    else:
-        logger.info("ℹ️ Supabase check pulado em Development")
-
-    # 3. Teste de Configuração do Worker
+            logger.error(f"❌ FALHA SUPABASE: {e}")
+            errors.append(str(e))
+    
+    # 3. Config Check
     try:
-        # Tenta carregar config local para validar integridade do JSON
-        test_config = AgentConfig("config/agent_config.json", env=settings.APP_ENV)
-        logger.info(f"✅ Configuração Local OK: {test_config.config_path}")
+        AgentConfig("config/agent_config.json", env=settings.APP_ENV)
+        logger.info(f"✅ Configuração OK")
     except Exception as e:
-        msg = f"❌ FALHA DE CONFIG: Erro ao carregar JSON de configuração ({e})"
-        logger.error(msg)
-        errors.append(msg)
+        logger.error(f"❌ FALHA CONFIG: {e}")
+        errors.append(str(e))
 
-    # RESUMO DO DIAGNÓSTICO
     if errors:
-        logger.critical("🚨 O SELF-TEST ENCONTROU PROBLEMAS CRÍTICOS:")
-        for err in errors:
-            logger.critical(f"   -> {err}")
-        logger.critical("⚠️ A APLICAÇÃO PODE FICAR INSTÁVEL OU FALHAR.")
+        logger.critical("🚨 SELF-TEST COM ERROS!")
     else:
-        logger.info("✨ SELF-TEST CONCLUÍDO: Todos os sistemas operacionais.")
-
+        logger.info("✨ SELF-TEST CONCLUÍDO")
 
 # ==============================================================================
 # INICIALIZAÇÃO GLOBAL (SAFE LOAD)
@@ -91,230 +68,146 @@ worker = None
 worker_task = None
 
 try:
-    # Carrega configuração do arquivo (desenvolvimento local/fallback)
-    # Isso é necessário para o worker global de desenvolvimento
     base_agent_config = AgentConfig("config/agent_config.json", env=settings.APP_ENV)
-    
-    # Instancia worker global (usado apenas em Development)
     worker = VoiceAssistantWorker(agent_config=base_agent_config, settings=settings)
 except Exception as e:
-    logger.error(f"⚠️ Erro na inicialização do worker global (não crítico para Prod): {e}")
-
+    logger.error(f"⚠️ Erro worker global: {e}")
 
 # ==============================================================================
-# LIFESPAN (CICLO DE VIDA)
+# LIFESPAN
 # ==============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- STARTUP ---
-    logger.info(f"🟢 STARTUP: Iniciando aplicação em ambiente: {settings.APP_ENV.upper()}")
-    
-    # 1. Executa diagnóstico de infraestrutura
+    logger.info(f"🟢 STARTUP: {settings.APP_ENV.upper()}")
     await run_startup_diagnostics()
     
-    # 2. Inicia Worker Global (APENAS EM DEVELOPMENT)
-    # Em Staging/Prod, o worker é on-demand (por chamada), então não iniciamos aqui.
     global worker_task
     if settings.is_development() and worker:
         worker_task = asyncio.create_task(worker.connect_and_run())
-        logger.info("🎙️ Worker de desenvolvimento iniciado em background")
+        logger.info("🎙️ Worker dev iniciado")
     
     yield
     
-    # --- SHUTDOWN ---
-    logger.info("🔴 SHUTDOWN: Encerrando aplicação...")
-    
-    # Encerra worker global se estiver rodando
-    if worker:
-        worker.shutdown()
-        
-    if worker_task:
+    logger.info("🔴 SHUTDOWN")
+    if worker: worker.shutdown()
+    if worker_task: 
         worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
-
+        try: await worker_task
+        except: pass
 
 app = FastAPI(title="Azure VoiceLive Agent", lifespan=lifespan)
 
-
 # ==============================================================================
-# ENDPOINTS HTTP
+# HTTP ENDPOINTS
 # ==============================================================================
 @app.get("/health")
 async def health_check():
-    """Health Check para monitoramento"""
-    
-    # CORREÇÃO: Mantém o log "dedo-duro" em Staging/Dev, mas silencia em Production
+    # Log condicional para monitorar staging
     if not settings.is_production():
-        logger.info(f"💓 HEALTH CHECK RECEBIDO! (Status: Verificando...)")
+        logger.info(f"💓 HEALTH CHECK RECEBIDO!")
     
-    # Em staging/prod, status é 'ready' se o servidor estiver de pé
     status = "ready"
-    
-    # Em dev, verificamos a conexão real do worker global
     if settings.is_development() and worker:
         status = "connected" if worker.connection else "initializing"
     
-    return {
-        "status": "ok",
-        "env": settings.APP_ENV,
-        "worker_status": status,
-        "checks": "self-test-passed"
-    }
-async def health_check():
-    """Health Check para monitoramento"""
-    
-    # === ADICIONADO: Log para "dedurar" o HealthCheck ===
-    origin = "Local/Docker" # Simplificação
-    logger.info(f"💓 HEALTH CHECK RECEBIDO! (Status: Verificando...)")
-    # ====================================================
-
-    # Em staging/prod, status é 'ready' se o servidor estiver de pé
-    status = "ready"
-    
-    # Em dev, verificamos a conexão real do worker global
-    if settings.is_development() and worker:
-        status = "connected" if worker.connection else "initializing"
-    
-    return {
-        "status": "ok",
-        "env": settings.APP_ENV,
-        "worker_status": status,
-        "checks": "self-test-passed"
-    }
-
-async def health_check():
-    """Health Check para monitoramento"""
-    # Em staging/prod, status é 'ready' se o servidor estiver de pé
-    status = "ready"
-    
-    # Em dev, verificamos a conexão real do worker global
-    if settings.is_development() and worker:
-        status = "connected" if worker.connection else "initializing"
-    
-    return {
-        "status": "ok",
-        "env": settings.APP_ENV,
-        "worker_status": status,
-        "checks": "self-test-passed"
-    }
-
+    return {"status": "ok", "env": settings.APP_ENV, "worker": status}
 
 @app.get("/")
 async def root():
-    return {"message": "Geon AI Voice Agent Running", "docs": "/docs"}
-
+    return {"message": "Twilio Media Stream Ready", "docs": "/docs"}
 
 # ==============================================================================
-# WEBSOCKET ENDPOINT - MULTI-TENANT AUDIO STREAMING
+# WEBSOCKET - TWILIO MEDIA STREAMS
 # ==============================================================================
 @app.websocket("/ws/audio/{sip_number}")
 async def audio_stream(websocket: WebSocket, sip_number: str):
-    """
-    Endpoint WebSocket para streaming de áudio multi-tenant.
-    Cria um worker dedicado para cada conexão.
-    """
+    """Integração com Twilio Media Streams"""
     await websocket.accept()
-    logger.info(f"🔌 Nova conexão WebSocket: {sip_number}")
+    logger.info(f"🔌 Conexão Twilio recebida para: {sip_number}")
     
     session_worker = None
     session_task = None
+    stream_sid = None  # ID da chamada na Twilio
     
     try:
-        # 1. Busca configuração do cliente no Supabase
-        client_manager = ClientManager(
-            supabase_url=settings.SUPABASE_URL,
-            supabase_key=settings.SUPABASE_SERVICE_ROLE_KEY
-        )
-        
+        # 1. Configuração do Cliente
+        client_manager = ClientManager(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
         client_config = client_manager.get_client_config(sip_number)
         
         if not client_config:
-            logger.warning(f"⚠️ Cliente não encontrado no Supabase: {sip_number}")
-            # Código 4004 não é padrão WS, usamos 4000-4999 para app-specific ou 1008 (Policy Violation)
-            await websocket.close(code=4000, reason="Cliente não encontrado")
+            logger.warning(f"⚠️ Cliente não encontrado: {sip_number}")
+            await websocket.close(code=4000)
             return
-        
-        logger.info(f"✅ Configuração carregada para: {sip_number}")
-        
-        # 2. Callbacks de Áudio
-        async def send_audio_to_client(audio_data: bytes):
-            """Envia áudio do Azure de volta para o cliente WebSocket"""
-            try:
-                encoded = base64.b64encode(audio_data).decode('utf-8')
-                await websocket.send_text(encoded)
-            except Exception as e:
-                logger.error(f"❌ Erro ao enviar áudio para cliente: {e}")
 
-        async def send_interruption_signal():
-            """Envia sinal para o cliente limpar o buffer de áudio (Barge-in)"""
+        logger.info(f"✅ Config carregada. Iniciando worker...")
+
+        # 2. Callbacks adaptados para Twilio
+        async def send_audio_to_twilio(audio_data: bytes):
+            """Empacota áudio no formato JSON da Twilio"""
+            if not stream_sid: return
             try:
-                logger.info("🛑 Enviando sinal de CLEAR_BUFFER")
-                await websocket.send_text("CLEAR_BUFFER")
+                payload = base64.b64encode(audio_data).decode('utf-8')
+                message = {
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {"payload": payload}
+                }
+                await websocket.send_json(message)
             except Exception as e:
-                logger.error(f"❌ Erro ao enviar sinal de interrupção: {e}")
-        
-        # 3. Cria Worker Dedicado (On-Demand)
+                logger.error(f"❌ Erro envio Twilio: {e}")
+
+        async def send_clear_buffer():
+            """Envia evento 'clear' para Twilio (Interrupção/Barge-in)"""
+            if not stream_sid: return
+            try:
+                await websocket.send_json({
+                    "event": "clear",
+                    "streamSid": stream_sid
+                })
+                logger.info("🛑 Buffer Twilio limpo (Interrupção)")
+            except: pass
+
+        # 3. Inicializa Worker
         session_worker = VoiceAssistantWorker(
             agent_config=client_config,
             settings=settings,
-            audio_output_handler=send_audio_to_client,
-            interruption_handler=send_interruption_signal
+            audio_output_handler=send_audio_to_twilio,
+            interruption_handler=send_clear_buffer
         )
-        
-        # 4. Inicia conexão Azure
         session_task = asyncio.create_task(session_worker.connect_and_run())
         
-        # Aguarda brevemente para garantir conexão
-        # (Idealmente, connect_and_run deveria sinalizar prontidão, mas sleep ajuda)
-        await asyncio.sleep(1)
-        
-        if not session_worker.connection:
-             # Se falhou conectar rápido, pode ser erro de credencial Azure
-             logger.error(f"❌ Falha de conexão inicial com Azure para: {sip_number}")
-             # Não fechamos imediatamente para permitir retentativa interna, 
-             # mas logamos o alerta.
-        
-        logger.info(f"🎙️ Sessão de áudio ativa para: {sip_number}")
-        
-        # 5. Loop principal: recebe áudio do cliente
+        # 4. Loop de Processamento Twilio
         while True:
             try:
-                # Recebe áudio do cliente
-                audio_data = await websocket.receive_text()
+                # Twilio envia TEXTO contendo JSON
+                message = await websocket.receive_text()
+                data = json.loads(message)
+                event_type = data.get("event")
+
+                if event_type == "media":
+                    # Extrai áudio e envia para Azure
+                    if session_worker.connection:
+                        audio_chunk = data["media"]["payload"]
+                        # Nota: Azure espera base64 string, que é exatamente o que temos
+                        await session_worker.connection.input_audio_buffer.append(audio=audio_chunk)
                 
-                # Envia para o buffer de entrada do Azure se conectado
-                if session_worker.connection:
-                    await session_worker.connection.input_audio_buffer.append(audio=audio_data)
+                elif event_type == "start":
+                    stream_sid = data["start"]["streamSid"]
+                    logger.info(f"📞 Stream iniciado (SID: {stream_sid})")
+                
+                elif event_type == "stop":
+                    logger.info("📞 Chamada encerrada pela Twilio")
+                    break
                     
             except WebSocketDisconnect:
-                logger.info(f"🔌 Cliente desconectado: {sip_number}")
                 break
             except Exception as e:
-                logger.error(f"❌ Erro no loop de áudio: {e}")
+                logger.error(f"❌ Erro processamento msg: {e}")
                 break
-    
+
     except Exception as e:
-        logger.critical(f"❌ Erro crítico na sessão WebSocket: {e}", exc_info=True)
-        try:
-            await websocket.close(code=1011, reason="Erro interno do servidor")
-        except:
-            pass
-    
+        logger.critical(f"❌ Erro sessão: {e}", exc_info=True)
     finally:
-        # 6. Limpeza de recursos
-        logger.info(f"🧹 Limpando recursos para: {sip_number}")
-        
-        if session_worker:
-            session_worker.shutdown()
-        
-        if session_task:
-            session_task.cancel()
-            try:
-                await session_task
-            except asyncio.CancelledError:
-                pass
-        
-        logger.info(f"✅ Sessão encerrada: {sip_number}")
+        if session_worker: session_worker.shutdown()
+        if session_task: session_task.cancel()
+        logger.info(f"✅ Sessão finalizada: {sip_number}")
