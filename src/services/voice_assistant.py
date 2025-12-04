@@ -66,49 +66,66 @@ class VoiceAssistantWorker:
                 self.connection = conn
                 
                 # Inicializa Áudio Local (Apenas Dev/PCM16)
-                # Se estiver usando G711 (Twilio), não ativamos o processador local
-                is_pcm16 = self.agent_config.config.get('audio', {}).get('input_format') == 'PCM16'
+                # Verifica formato no config. Se for G711 (Telefonia), desativa áudio local.
+                audio_config = self.agent_config.config.get('audio', {})
+                input_fmt_str = audio_config.get('input_format', 'PCM16').upper()
+                
+                is_pcm16 = input_fmt_str == 'PCM16'
+                
                 if self.settings.is_development() and AUDIO_AVAILABLE and is_pcm16:
                     self.audio_processor = AudioProcessor(conn)
                     self.audio_processor.start_capture()
                     self.audio_processor.start_playback()
                     logger.info("🎙️ Modo Development: Áudio Local Ativo")
                 else:
-                    logger.info("ℹ️ Modo Headless/Telefonia: Áudio Local Desativado")
+                    logger.info(f"ℹ️ Modo Headless/Telefonia: Áudio Local Desativado (Format: {input_fmt_str})")
 
                 # Configura Sessão
                 await self._configure_session()
 
-                # --- SAUDAÇÃO INICIAL (ALÔ) ---
-                logger.info("👋 Enviando saudação inicial...")
-                await self.connection.response.create(
-                    response={
-                        "instructions": "Diga apenas 'Alô' e aguarde."
-                    }
-                )
+                # --- SAUDAÇÃO INICIAL ---
+                # Dica: Em telefonia, às vezes é melhor esperar o usuário falar "Alô" 
+                # ou mandar uma mensagem inicial proativa.
+                logger.info("👋 Enviando instrução inicial de saudação...")
+                # await self.connection.response.create(
+                #     response={
+                #         "instructions": "Diga 'Alô' para iniciar."
+                #     }
+                # )
                 
                 # Loop de Eventos
                 await self._process_events()
 
         except Exception as e:
-            # Habilita stack trace em staging/dev
             show_exc_info = self.settings.is_development() or self.settings.is_staging()
             logger.critical(f"❌ Erro fatal no Worker: {e}", exc_info=show_exc_info)
 
     async def _configure_session(self):
         """Envia configurações para o Azure com suporte a Codecs"""
         
-        # 1. Mapeamento de Formatos (PCM16 vs G711)
+        # 1. Recupera Configuração
         audio_config = self.agent_config.config.get('audio', {})
-        input_fmt_str = audio_config.get('input_format', 'PCM16')
-        output_fmt_str = audio_config.get('output_format', 'PCM16')
+        
+        # 2. Sanitização (.upper() é CRÍTICO aqui)
+        # O banco pode retornar 'g711_ulaw', mas o Enum exige 'G711_ULAW'
+        input_fmt_str = str(audio_config.get('input_format', 'PCM16')).upper()
+        output_fmt_str = str(audio_config.get('output_format', 'PCM16')).upper()
 
-        # Mapeia string do JSON para Enum do Azure SDK
-        # Nota: G711_ULAW é o padrão para Twilio
-        input_fmt = getattr(InputAudioFormat, input_fmt_str, InputAudioFormat.PCM16)
-        output_fmt = getattr(OutputAudioFormat, output_fmt_str, OutputAudioFormat.PCM16)
+        # 3. Mapeamento Seguro
+        # Se falhar o getattr, usamos PCM16 e LOGAMOS O AVISO
+        try:
+            input_fmt = getattr(InputAudioFormat, input_fmt_str)
+        except AttributeError:
+            logger.warning(f"⚠️ Formato Input '{input_fmt_str}' desconhecido/inválido. Usando PCM16.")
+            input_fmt = InputAudioFormat.PCM16
 
-        logger.info(f"🎛️ Configurando Áudio: Input={input_fmt} | Output={output_fmt}")
+        try:
+            output_fmt = getattr(OutputAudioFormat, output_fmt_str)
+        except AttributeError:
+            logger.warning(f"⚠️ Formato Output '{output_fmt_str}' desconhecido/inválido. Usando PCM16.")
+            output_fmt = OutputAudioFormat.PCM16
+
+        logger.info(f"🎛️ Configurando Áudio Sessão: Input={input_fmt} | Output={output_fmt}")
 
         vad_config = ServerVad(
             threshold=self.agent_config.config['turn_detection']['threshold'],
@@ -120,15 +137,15 @@ class VoiceAssistantWorker:
             modalities=[Modality.TEXT, Modality.AUDIO],
             instructions=self.agent_config.instructions,
             voice=AzureStandardVoice(name=self.agent_config.voice),
-            input_audio_format=input_fmt,   # Dinâmico
-            output_audio_format=output_fmt, # Dinâmico
+            input_audio_format=input_fmt,
+            output_audio_format=output_fmt,
             turn_detection=vad_config,
             temperature=self.agent_config.temperature,
             max_response_output_tokens=self.agent_config.max_tokens
         )
         
         await self.connection.session.update(session=session_config)
-        logger.info("✅ Sessão configurada com sucesso")
+        logger.info("✅ Sessão atualizada no Azure com sucesso")
 
     async def _process_events(self):
         """Processa eventos recebidos do Azure"""
@@ -161,6 +178,10 @@ class VoiceAssistantWorker:
             
             elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
                 logger.info(f"👤 Usuário: {event.transcript}")
+            
+            # (Opcional) Captura sessão criada para debug
+            elif event.type == ServerEventType.SESSION_CREATED:
+                logger.debug(f"ℹ️ Sessão criada: {event.session.id}")
 
     def shutdown(self):
         self._shutdown_event.set()
