@@ -65,6 +65,69 @@ class VoiceAssistantWorker:
             ) as conn:
                 self.connection = conn
                 
+                # Inicializa Áudio Local (Apenas se não for G711)
+                audio_config = self.agent_config.config.get('audio', {})
+                input_fmt_str = str(audio_config.get('input_format', 'PCM16')).upper()
+                is_pcm16 = input_fmt_str == 'PCM16'
+                
+                if self.settings.is_development() and AUDIO_AVAILABLE and is_pcm16:
+                    self.audio_processor = AudioProcessor(conn)
+                    self.audio_processor.start_capture()
+                    self.audio_processor.start_playback()
+                    logger.info("🎙️ Modo Development: Áudio Local Ativo")
+                else:
+                    logger.info(f"ℹ️ Modo Headless/Telefonia: Áudio Local Desativado (Format: {input_fmt_str})")
+
+                # 1. Configura Sessão (Rápido)
+                await self._configure_session()
+
+                # 2. Agenda a Saudação para rodar EM PARALELO
+                # Não usamos await aqui! Isso permite que o código desça para o _process_events
+                asyncio.create_task(self._send_initial_greeting())
+                
+                # 3. Inicia o processamento de eventos IMEDIATAMENTE
+                # Isso mantém o WebSocket vivo e processando os ACKs do servidor
+                await self._process_events()
+
+        except Exception as e:
+            show_exc_info = self.settings.is_development() or self.settings.is_staging()
+            logger.critical(f"❌ Erro fatal no Worker: {e}", exc_info=show_exc_info)
+
+    async def _send_initial_greeting(self):
+        """Envia a saudação após um breve delay, permitindo que o loop principal inicie"""
+        try:
+            # Pequeno delay para garantir que _process_events já pegou o controle
+            await asyncio.sleep(0.5)
+            
+            logger.info("👋 Disparando saudação inicial (Background Task)...")
+            
+            # Método mais seguro: Forçar resposta com instrução explícita
+            # (Menos propenso a erro que injetar item de usuário falso)
+            await self.connection.response.create(
+                response={
+                    "instructions": "Diga sua saudação inicial agora. Seja breve, amigável e profissional."
+                }
+            )
+        except Exception as e:
+            # Se falhar, não derruba a chamada, apenas loga
+            logger.warning(f"⚠️ Saudação inicial não pôde ser enviada: {e}")
+        """Loop principal de conexão"""
+        try:
+            # Autenticação
+            if self.settings.AZURE_VOICELIVE_API_KEY:
+                cred = AzureKeyCredential(self.settings.AZURE_VOICELIVE_API_KEY)
+            else:
+                cred = DefaultAzureCredential()
+
+            logger.info(f"🔌 Conectando ao modelo: {self.settings.AZURE_VOICELIVE_MODEL}...")
+            
+            async with connect(
+                endpoint=self.settings.AZURE_VOICELIVE_ENDPOINT,
+                credential=cred,
+                model=self.settings.AZURE_VOICELIVE_MODEL
+            ) as conn:
+                self.connection = conn
+                
                 # Inicializa Áudio Local (Apenas Dev/PCM16)
                 # Verifica formato no config. Se for G711 (Telefonia), desativa áudio local.
                 audio_config = self.agent_config.config.get('audio', {})
@@ -82,9 +145,6 @@ class VoiceAssistantWorker:
 
                 # Configura Sessão
                 await self._configure_session()
-
-                logger.info("⏳ Aguardando estabilização da conexão...")
-                await asyncio.sleep(3.0)
 
                 # --- SAUDAÇÃO INICIAL ---
                 logger.info("👋 Enviando instrução inicial de saudação...")
