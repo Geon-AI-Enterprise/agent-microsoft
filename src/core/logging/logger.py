@@ -198,12 +198,21 @@ def configure_third_party_loggers(environment: str):
         logging.getLogger('uvicorn').setLevel(logging.WARNING)
         logging.getLogger('uvicorn.access').setLevel(logging.ERROR)
     
-    # Uvicorn - logs de acesso muito verbosos
-    if is_dev:
+    if is_dev or is_staging:
+        # Em dev e staging, queremos ver logs de sistema (INFO)
         logging.getLogger('uvicorn').setLevel(logging.INFO)
-        logging.getLogger('uvicorn.access').setLevel(logging.WARNING)
     else:
         logging.getLogger('uvicorn').setLevel(logging.WARNING)
+        
+    # Nível de log para o acesso HTTP (Health Check)
+    if is_dev:
+        # Em development, WARNING para não poluir muito (INFO de sistema já está ON)
+        logging.getLogger('uvicorn.access').setLevel(logging.WARNING) 
+    elif is_staging:
+        # CRÍTICO: Em staging, usamos INFO para ver os logs 200 OK do Health Check
+        logging.getLogger('uvicorn.access').setLevel(logging.INFO) 
+    else:
+        # Production: ERROR para logs de acesso (máximo silêncio)
         logging.getLogger('uvicorn.access').setLevel(logging.ERROR)
     
     # FastAPI
