@@ -198,8 +198,11 @@ def configure_third_party_loggers(environment: str):
         logging.getLogger('uvicorn').setLevel(logging.INFO)
     else:
         logging.getLogger('uvicorn').setLevel(logging.WARNING)
+
+    # 4. Websockets (Remove o spam de frames de mídia "media")
+    logging.getLogger('websockets').setLevel(logging.WARNING)
         
-    # 4. Logs de Acesso HTTP (Health Check)
+    # 5. Logs de Acesso HTTP (Health Check)
     if is_dev:
         logging.getLogger('uvicorn.access').setLevel(logging.WARNING) 
     elif is_staging:
@@ -208,7 +211,7 @@ def configure_third_party_loggers(environment: str):
     else:
         logging.getLogger('uvicorn.access').setLevel(logging.ERROR)
     
-    # 5. FastAPI
+    # 6. FastAPI
     if not is_dev:
         logging.getLogger('fastapi').setLevel(logging.WARNING)
     """
