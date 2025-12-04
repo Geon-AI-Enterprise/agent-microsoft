@@ -154,7 +154,67 @@ class VoiceAssistantWorker:
         except Exception as e:
             logger.warning(f"⚠️ Saudação inicial não pôde ser enviada (pode ser ignorado se a chamada caiu): {e}")
 
+# Em src/services/voice_assistant.py, dentro da classe VoiceAssistantWorker
+
     async def _process_events(self):
+        """Processa eventos recebidos do Azure com Barge-in Não-Bloqueante"""
+        async for event in self.connection:
+            if self._shutdown_event.is_set():
+                break
+
+            # Barge-in (Interrupção)
+            if event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
+                
+                # --- CORREÇÃO: LÓGICA DE ESTADO ---
+                if self.is_agent_speaking:
+                    logger.info("👤 Usuário falando: BARGE-IN DETECTADO! Interrompendo agente.")
+                    
+                    # 1. Limpa áudio local (Dev)
+                    if self.audio_processor:
+                        self.audio_processor.skip_pending_audio()
+                    
+                    # 2. Limpa buffer do Twilio (Prod) - ASYNC/FIRE-AND-FORGET
+                    if self.interruption_handler:
+                        asyncio.create_task(self.interruption_handler())
+
+                    # 3. Cancela resposta no Azure - ASYNC/FIRE-AND-FORGET
+                    asyncio.create_task(self._safe_cancel_response())
+                    
+                    # !!! REMOVIDO: Não resetamos o estado aqui. 
+                    # self.is_agent_speaking = False # LINHA REMOVIDA
+                    
+                else:
+                    logger.debug("👤 Usuário falando: Turno normal (Agente estava em silêncio).")
+                # -------------------------------
+
+            elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
+                # --- Rastreamento de estado quando o agente começa a falar ---
+                if not self.is_agent_speaking:
+                    self.is_agent_speaking = True
+                    logger.debug("🔊 Agente começou a falar (Setting state=True)")
+                # -----------------------------------------------------------------
+
+                if self.audio_output_handler:
+                    await self.audio_output_handler(event.delta)
+                elif self.audio_processor:
+                    self.audio_processor.queue_audio(event.delta)
+
+            elif event.type == ServerEventType.ERROR:
+                logger.error(f"❌ Erro Azure: {event.error.message}")
+
+            elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
+                logger.info(f"🤖 Agente: {event.transcript}")
+                
+                # --- Rastreamento de estado quando o agente termina de falar ---
+                self.is_agent_speaking = False
+                logger.debug("🔇 Agente terminou de falar (Setting state=False)")
+                # -------------------------------------------------------------------
+
+            elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
+                logger.info(f"👤 Usuário: {event.transcript}")
+            
+            elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
+                logger.info("🛑 Detecção de silêncio (VAD Stopped) - Processando resposta...")
         """Processa eventos recebidos do Azure com Barge-in Não-Bloqueante"""
         async for event in self.connection:
             if self._shutdown_event.is_set():
