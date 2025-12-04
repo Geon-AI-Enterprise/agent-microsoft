@@ -81,7 +81,7 @@ class VoiceAssistantWorker:
                 # Cria uma resposta imediata para quebrar o silêncio
                 await self.connection.response.create(
                     response={
-                        "instructions": "Faça uma saudação curta e amigável apresentando-se como Lia."
+                        "instructions": "Diga a única palavra 'Alô' e encerre a fala."
                     }
                 )
                 # --------------------------------

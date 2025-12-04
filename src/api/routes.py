@@ -33,9 +33,9 @@ async def lifespan(app: FastAPI):
     
     # Inicia o Worker em background (apenas para desenvolvimento local)
     global worker_task
-    if settings.is_development() or settings.is_staging():
+    if settings.is_development():
         worker_task = asyncio.create_task(worker.connect_and_run())
-        logger.info(f"🎙️ Worker de inicialização ({settings.APP_ENV}) iniciado em background")
+        logger.info("🎙️ Worker de desenvolvimento iniciado em background")
     
     yield
     
