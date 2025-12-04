@@ -139,7 +139,7 @@ class VoiceAssistantWorker:
         # 2. DEFINIÇÃO HARDCODED DE VAD (Performance Tuning)
         # Substituímos a leitura do config por valores otimizados para produção
         vad_config = ServerVad(
-            threshold=0.62,              # Sensibilidade calibrada para evitar ruído de linha
+            threshold=0.73,              # Sensibilidade calibrada para evitar ruído de linha
             prefix_padding_ms=200,      # Buffer curto para menor latência
             silence_duration_ms=250     # Detecção rápida de fim de fala
         )
