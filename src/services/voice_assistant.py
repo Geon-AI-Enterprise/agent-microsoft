@@ -90,7 +90,8 @@ class VoiceAssistantWorker:
                 await self._process_events()
 
         except Exception as e:
-            logger.critical(f"❌ Erro fatal no Worker: {e}", exc_info=self.settings.is_development())
+            show_exc_info = self.settings.is_development() or self.settings.is_staging()
+            logger.critical(f"❌ Erro fatal no Worker: {e}", exc_info=show_exc_info)
 
     async def _configure_session(self):
         """Envia configurações do agent_config.json para o Azure"""
