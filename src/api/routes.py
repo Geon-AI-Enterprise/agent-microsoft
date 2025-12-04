@@ -146,6 +146,26 @@ app = FastAPI(title="Azure VoiceLive Agent", lifespan=lifespan)
 async def health_check():
     """Health Check para monitoramento"""
     
+    # CORREÇÃO: Mantém o log "dedo-duro" em Staging/Dev, mas silencia em Production
+    if not settings.is_production():
+        logger.info(f"💓 HEALTH CHECK RECEBIDO! (Status: Verificando...)")
+    
+    # Em staging/prod, status é 'ready' se o servidor estiver de pé
+    status = "ready"
+    
+    # Em dev, verificamos a conexão real do worker global
+    if settings.is_development() and worker:
+        status = "connected" if worker.connection else "initializing"
+    
+    return {
+        "status": "ok",
+        "env": settings.APP_ENV,
+        "worker_status": status,
+        "checks": "self-test-passed"
+    }
+async def health_check():
+    """Health Check para monitoramento"""
+    
     # === ADICIONADO: Log para "dedurar" o HealthCheck ===
     origin = "Local/Docker" # Simplificação
     logger.info(f"💓 HEALTH CHECK RECEBIDO! (Status: Verificando...)")
@@ -164,7 +184,7 @@ async def health_check():
         "worker_status": status,
         "checks": "self-test-passed"
     }
-    
+
 async def health_check():
     """Health Check para monitoramento"""
     # Em staging/prod, status é 'ready' se o servidor estiver de pé
