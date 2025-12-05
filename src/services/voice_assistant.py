@@ -4,13 +4,6 @@ Voice Assistant Worker Service
 Core do Assistente: Gerencia Conexão, Sessão e Eventos do Azure VoiceLive.
 Adaptado para suportar telefonia (G.711 Mu-Law).
 
-Correções v2.2:
-- Removido código duplicado
-- Implementado grace period para proteção de saudação
-- Adicionado debouncing para eventos VAD
-- Melhorado logging e rastreamento de estados
-- Limpeza de input_audio_buffer no barge-in
-- Modo saudação para prevenir auto-resposta
 """
 
 import asyncio
@@ -58,11 +51,12 @@ class VoiceAssistantWorker:
         self._greeting_sent_at = None
         self._is_greeting_mode = False
         self._last_vad_event = 0
+        self._agent_stop_speaking_time = 0
         
         # Configurações de Proteção
-        self._grace_period_seconds = getattr(settings, 'GREETING_GRACE_PERIOD_SECONDS', 2.0)
-        self._vad_debounce_ms = getattr(settings, 'VAD_DEBOUNCE_MS', 300)
-        self._greeting_delay = getattr(settings, 'GREETING_DELAY_SECONDS', 1.5)
+        self._grace_period_seconds = self.settings.GREETING_GRACE_PERIOD_SECONDS or 2.0
+        self._vad_debounce_ms = self.settings.VAD_DEBOUNCE_MS or 300
+        self._greeting_delay = self.settings.GREETING_DELAY_SECONDS or 1.5
         
         logger.info(f"🚀 Worker inicializado | Env: {self.settings.APP_ENV} | Voz: {self.agent_config.voice}")
         logger.debug(f"🛡️ Proteções: Grace={self._grace_period_seconds}s | Debounce={self._vad_debounce_ms}ms | Delay={self._greeting_delay}s")
@@ -112,6 +106,55 @@ class VoiceAssistantWorker:
             logger.critical(f"❌ Erro fatal no Worker: {e}", exc_info=show_exc_info)
 
     async def _configure_session(self):
+        """
+        Configura a sessão com hierarquia: 
+        1. .env (Prioridade Máxima)
+        2. agent_config.json / Supabase (Fallback)
+        3. Hardcoded Default (Segurança)
+        """
+        
+        # 1. Recupera Configuração de Áudio (Mantém lógica anterior)
+        audio_config = self.agent_config.config.get('audio', {})
+        input_fmt_str = str(audio_config.get('input_format', 'PCM16')).upper()
+        output_fmt_str = str(audio_config.get('output_format', 'PCM16')).upper()
+        
+        # Mapeamento Seguro
+        input_fmt = getattr(InputAudioFormat, input_fmt_str, InputAudioFormat.PCM16)
+        output_fmt = getattr(OutputAudioFormat, output_fmt_str, OutputAudioFormat.PCM16)
+
+        # 2. DEFINIÇÃO DE VAD (Lógica de Prioridade .env > JSON)
+        turn_config = self.agent_config.config.get('turn_detection', {})
+        
+        # Helper para escolher o valor correto
+        def get_val(env_val, json_val, default_val):
+            if env_val is not None: return env_val  # Prioridade 1: .env
+            if json_val is not None: return json_val # Prioridade 2: JSON
+            return default_val                       # Prioridade 3: Default
+
+        vad_config = ServerVad(
+            threshold=get_val(self.settings.VAD_THRESHOLD, turn_config.get('threshold'), 0.5),
+            prefix_padding_ms=get_val(self.settings.VAD_PREFIX_PADDING_MS, turn_config.get('prefix_padding_ms'), 300),
+            silence_duration_ms=get_val(self.settings.VAD_SILENCE_DURATION_MS, turn_config.get('silence_duration_ms'), 500)
+        )
+        
+        # 3. Configuração da Sessão
+        # Mesma lógica para temperatura e tokens
+        temp = get_val(self.settings.MODEL_TEMPERATURE, self.agent_config.temperature, 0.7)
+        max_tokens = get_val(self.settings.MAX_RESPONSE_OUTPUT_TOKENS, self.agent_config.max_tokens, 800)
+
+        session_config = RequestSession(
+            modalities=[Modality.TEXT, Modality.AUDIO],
+            instructions=self.agent_config.instructions,
+            voice=AzureStandardVoice(name=self.agent_config.voice),
+            input_audio_format=input_fmt,
+            output_audio_format=output_fmt,
+            turn_detection=vad_config,
+            temperature=temp,
+            max_response_output_tokens=max_tokens
+        )
+        
+        await self.connection.session.update(session=session_config)
+        logger.info(f"✅ Sessão Configurada: VAD(t={vad_config.threshold}, s={vad_config.silence_duration_ms}ms) | Temp={temp}")
         """Envia configurações para o Azure lendo das variáveis de ambiente."""
         
         # 1. Recupera Configuração de Codec
@@ -204,76 +247,72 @@ class VoiceAssistantWorker:
             # ========== BARGE-IN (INTERRUPÇÃO) ==========
             if event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
                 
-                # Proteção 1: Grace Period após saudação
+                # Proteção contra Eco na Saudação
                 if self._is_in_grace_period() or self._is_greeting_mode:
-                    logger.debug("🛡️ Grace period / greeting ativo - ignorando detecção de fala")
+                    logger.debug("🛡️ Grace period ativo - Ignorando possível eco da saudação")
                     continue
+
+                logger.info("🗣️ VAD: Fala detectada (Speech Started)")
                 
-                # Proteção 2: Debouncing
-                if not self._should_process_vad_event():
-                    logger.debug("⏭️ Evento VAD ignorado (debouncing)")
-                    continue
-                
-                # Lógica de Barge-in
+                # Se o agente estava falando, INTERROMPA IMEDIATAMENTE
                 if self.is_agent_speaking:
-                    logger.info("👤 Usuário falando: BARGE-IN DETECTADO! Interrompendo agente.")
+                    logger.info("⚡ BARGE-IN: Interrompendo agente...")
                     
-                    # 1. Limpa áudio local (Dev)
+                    # PASSO 1 (CRÍTICO): Parar o áudio no ouvido do usuário AGORA
+                    if self.interruption_handler:
+                        # Envia o comando "clear" para o Twilio/Frontend
+                        asyncio.create_task(self.interruption_handler())
+                    
                     if self.audio_processor:
                         self.audio_processor.skip_pending_audio()
-                    
-                    # 2. Limpa buffer do Twilio (Prod)
-                    if self.interruption_handler:
-                        asyncio.create_task(self.interruption_handler())
 
-                    # 3. Cancela resposta E limpa buffer de entrada
-                    asyncio.create_task(self._cancel_and_clear())
+                    # PASSO 2: Cancelar a geração de texto/áudio no Azure
+                    # Isso impede que o agente continue "pensando" na resposta antiga
+                    await self.connection.response.cancel()
                     
-                    # Reseta o estado
                     self.is_agent_speaking = False
-                    
-                else:
-                    logger.debug("👤 Usuário falando: Turno normal (Agente estava em silêncio).")
 
-            # ========== ÁUDIO DO AGENTE ==========
+            # =================================================================
+            # 2. O USUÁRIO PAROU DE FALAR (Processar Resposta)
+            # =================================================================
+            elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
+                 if self._is_greeting_mode:
+                    continue
+                 logger.info("🛑 VAD: Fim da fala (Speech Stopped) - Aguardando resposta...")
+
+            # =================================================================
+            # 3. ÁUDIO DO AGENTE (Output)
+            # =================================================================
             elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
+                # Só reproduz se não tivermos acabado de cancelar (Race condition check)
                 if not self.is_agent_speaking:
                     self.is_agent_speaking = True
-                    logger.debug("🔊 Agente começou a falar")
+                    logger.debug("🔊 Agente começou a emitir som")
 
                 if self.audio_output_handler:
                     await self.audio_output_handler(event.delta)
                 elif self.audio_processor:
                     self.audio_processor.queue_audio(event.delta)
 
-            # ========== ERROS ==========
-            elif event.type == ServerEventType.ERROR:
-                logger.error(f"❌ Erro Azure: {event.error.message}")
-
-            # ========== TRANSCRIÇÃO DO AGENTE ==========
+            # =================================================================
+            # 4. TRANSCRIÇÃO (Logs e Controle de Estado)
+            # =================================================================
             elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
-                logger.info(f"🤖 Agente: {event.transcript}")
-                
+                logger.info(f"🤖 Agente disse: {event.transcript}")
                 self.is_agent_speaking = False
-                logger.debug("🔇 Agente terminou de falar")
+
+                self._agent_stop_speaking_time = asyncio.get_event_loop().time()
                 
-                # Finaliza modo saudação após primeira transcrição
+                # Libera o modo saudação após a primeira frase completa
                 if self._is_greeting_mode:
                     self._is_greeting_mode = False
-                    logger.debug("✅ Modo saudação finalizado")
+                    logger.info("✅ Saudação concluída. Proteção de eco desativada.")
 
-            # ========== TRANSCRIÇÃO DO USUÁRIO ==========
             elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
-                logger.info(f"👤 Usuário: {event.transcript}")
-            
-            # ========== DETECÇÃO DE SILÊNCIO ==========
-            elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
-                # Ignora silêncio durante modo saudação
-                if self._is_greeting_mode:
-                    logger.debug("🚫 Modo saudação - ignorando detecção de silêncio")
-                    continue
-                
-                logger.info("🛑 Silêncio detectado (VAD) - Processando resposta...")
+                logger.info(f"👤 Usuário disse: {event.transcript}")
+
+            elif event.type == ServerEventType.ERROR:
+                logger.error(f"❌ Erro Azure: {event.error.message}")
 
     async def _cancel_and_clear(self):
         """Cancela resposta E limpa buffer de entrada (barge-in completo)"""
