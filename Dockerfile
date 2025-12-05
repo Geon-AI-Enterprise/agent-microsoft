@@ -5,7 +5,7 @@
 # ===== STAGE 1: Base =====
 FROM python:3.11-slim as base
 
-LABEL maintainer="Grupo RCR"
+LABEL maintainer="Geon AI"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -18,7 +18,7 @@ WORKDIR /app
 # ===== STAGE 2: Dependencies =====
 FROM base as dependencies
 
-# Instala dependências de sistema necessárias para compilar pacotes (PyAudio)
+# Dependências de sistema (GCC necessário para compilar webrtcvad)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     portaudio19-dev \
     gcc \
@@ -62,4 +62,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["python", "src/healthcheck.py"]
 
-CMD ["/bin/sh", "-c", "python -m src.main 2>&1 | grep --line-buffered -v 'NNPACK'"]
+CMD ["python", "-m", "src.main"]
