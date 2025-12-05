@@ -2,7 +2,7 @@
 API Routes - Twilio Integration
 
 Adaptado para processar eventos JSON do Twilio Media Streams.
-Inclui pré-processamento com WebRTC VAD (Leve e Eficiente).
+Inclui pré-processamento com WebRTC VAD (Leve e Eficiente) e proteções de robustez.
 """
 
 import asyncio
@@ -12,7 +12,7 @@ import logging
 import socket
 import time
 import audioop
-import webrtcvad  # <--- A nova biblioteca leve
+import webrtcvad
 from contextlib import asynccontextmanager
 from typing import List
 
@@ -27,41 +27,57 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # ==============================================================================
-# DIAGNÓSTICO DE STARTUP
+# DIAGNÓSTICO DE STARTUP (MANTIDO)
 # ==============================================================================
 async def run_startup_diagnostics():
     logger.info("🩺 INICIANDO DIAGNÓSTICO...")
     try:
-        # Teste rápido do WebRTC VAD
         vad = webrtcvad.Vad(3)
-        # Cria um frame de silêncio de 20ms a 8000Hz (320 bytes)
         frame = b'\x00' * 320
         assert vad.is_speech(frame, 8000) is False
         logger.info(f"✅ WebRTC VAD OK")
     except Exception as e:
         logger.error(f"❌ FALHA VAD: {e}")
 
-    # ... (restante dos diagnósticos de rede e supabase) ...
-    # Pode manter o código original de teste de rede e supabase aqui
-
 # ==============================================================================
-# INICIALIZAÇÃO E LIFESPAN (MANTIDOS IGUAIS)
+# INICIALIZAÇÃO GLOBAL (MANTIDO)
 # ==============================================================================
 worker = None
 worker_task = None
 
-# ... (Manter código de inicialização global e lifespan igual ao anterior) ...
-# Vou resumir para focar na mudança principal, mas você deve manter o código existente.
+try:
+    base_agent_config = AgentConfig("config/agent_config.json", env=settings.APP_ENV)
+    worker = VoiceAssistantWorker(agent_config=base_agent_config, settings=settings)
+except Exception as e:
+    logger.error(f"⚠️ Erro worker global: {e}")
 
+# ==============================================================================
+# LIFESPAN (MANTIDO)
+# ==============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info(f"🟢 STARTUP: {settings.APP_ENV.upper()}")
     await run_startup_diagnostics()
+    
+    global worker_task
+    if settings.is_development() and worker:
+        worker_task = asyncio.create_task(worker.connect_and_run())
+        logger.info("🎙️ Worker dev iniciado")
+    
     yield
+    
+    logger.info("🔴 SHUTDOWN")
     if worker: worker.shutdown()
+    if worker_task: 
+        worker_task.cancel()
+        try: await worker_task
+        except: pass
 
 app = FastAPI(title="Azure VoiceLive Agent", lifespan=lifespan)
 
-# ... (Endpoints HTTP /health e root mantidos iguais) ...
+# ==============================================================================
+# HTTP ENDPOINTS (MANTIDO)
+# ==============================================================================
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "env": settings.APP_ENV}
@@ -71,40 +87,41 @@ async def root():
     return {"message": "Twilio Media Stream Ready", "docs": "/docs"}
 
 # ==============================================================================
-# WEBSOCKET - TWILIO (COM WEBRTC VAD)
+# WEBSOCKET - TWILIO (COM CORREÇÕES DE ESTABILIDADE)
 # ==============================================================================
 @app.websocket("/ws/audio/{sip_number}")
 async def audio_stream(websocket: WebSocket, sip_number: str):
     await websocket.accept()
-    logger.info(f"🔌 Conexão Twilio: {sip_number}")
+    logger.info(f"🔌 Conexão Twilio recebida: {sip_number}")
     
     session_worker = None
     session_task = None
     stream_sid = None
     
     # --- CONFIGURAÇÃO VAD ---
-    # Modo 3 é o mais agressivo (filtra mais ruído)
     vad = webrtcvad.Vad(3)
-    
-    # Twilio (G.711) = 8000Hz
-    # WebRTC exige frames de 10, 20 ou 30ms.
-    # 20ms a 8000Hz = 160 amostras.
-    # Em PCM 16-bit (2 bytes/amostra), 160 * 2 = 320 bytes.
-    FRAME_SIZE_BYTES = 320 
+    FRAME_SIZE_BYTES = 320 # 20ms @ 8000Hz PCM16
     SAMPLE_RATE = 8000
     
     # Lógica de Silêncio
-    VAD_TIMEOUT_MS = 1000 # 1 segundo de silêncio fecha o turno
+    VAD_TIMEOUT_MS = 1000 
+    
+    # CORREÇÃO 1: Tempo de aquecimento (Warmup)
+    # Ignora áudio nos primeiros 3 segundos para proteger a saudação e evitar ruído inicial
+    AUDIO_IGNORE_SECONDS = 3.0 
+    start_time = time.time()
     
     try:
-        # ... (Lógica de carregar config do cliente - Mantida igual) ...
+        # Configuração do Cliente
         client_manager = ClientManager(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
         client_config = client_manager.get_client_config(sip_number)
+        
         if not client_config:
+            logger.warning(f"⚠️ Cliente não encontrado: {sip_number}")
             await websocket.close(code=4000)
             return
 
-        # ... (Callbacks send_audio e send_clear - Mantidos iguais) ...
+        # Callbacks
         async def send_audio_to_twilio(audio_data: bytes):
             if not stream_sid: return
             try:
@@ -120,6 +137,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
             if not stream_sid: return
             try:
                 await websocket.send_json({"event": "clear", "streamSid": stream_sid})
+                logger.info("🛑 Buffer Twilio limpo (Interrupção)")
             except: pass
 
         # Inicializa Worker
@@ -138,6 +156,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
         # Estado VAD
         last_speech_time = 0.0
         is_speaking = False
+        bytes_sent_in_turn = 0 # Contador para evitar commit vazio
         
         while True:
             try:
@@ -146,6 +165,10 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                 event_type = data.get("event")
 
                 if event_type == "media":
+                    # CORREÇÃO 1: Ignora áudio durante período de warmup (saudação)
+                    if (time.time() - start_time) < AUDIO_IGNORE_SECONDS:
+                        continue
+
                     payload = data["media"]["payload"]
                     
                     if session_worker.connection:
@@ -153,56 +176,75 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                         chunk_ulaw = base64.b64decode(payload)
                         chunk_pcm = audioop.ulaw2lin(chunk_ulaw, 2)
                         
-                        # 2. Bufferizar PCM para análise
+                        # 2. Bufferizar
                         pcm_buffer.extend(chunk_pcm)
                         packet_queue.append(payload)
                         
-                        # 3. Processar frames de tamanho exato (320 bytes = 20ms)
+                        # 3. Processar frames exatos
                         while len(pcm_buffer) >= FRAME_SIZE_BYTES:
                             frame = pcm_buffer[:FRAME_SIZE_BYTES]
-                            pcm_buffer = pcm_buffer[FRAME_SIZE_BYTES:] # Remove do buffer
+                            pcm_buffer = pcm_buffer[FRAME_SIZE_BYTES:]
                             
-                            # VAD Check (Retorna True/False instantaneamente)
                             if vad.is_speech(frame, SAMPLE_RATE):
                                 last_speech_time = time.time()
                                 if not is_speaking:
                                     is_speaking = True
+                                    bytes_sent_in_turn = 0 # Novo turno
                                     logger.info("🗣️ Voz detectada")
                         
                         # 4. Decisão de Envio
-                        # Se falou nos últimos X ms, envia tudo que está na fila
                         current_time = time.time()
                         silence_duration = (current_time - last_speech_time) * 1000
                         
                         if silence_duration < VAD_TIMEOUT_MS:
-                            # Estamos em um turno de fala ativo
+                            # Turno ativo: Envia fila
                             while packet_queue:
                                 p = packet_queue.pop(0)
                                 await session_worker.connection.input_audio_buffer.append(audio=p)
+                                bytes_sent_in_turn += len(p) # Contabiliza bytes base64
                         else:
-                            # Silêncio prolongado
+                            # Silêncio detectado
                             if is_speaking:
-                                logger.info(f"🛑 Silêncio ({silence_duration:.0f}ms). Turno Fechado.")
-                                # Limpa buffer do Azure para garantir que ele processe o que recebeu
-                                await session_worker.connection.input_audio_buffer.commit()
+                                logger.info(f"🛑 Silêncio ({silence_duration:.0f}ms). Tentando fechar turno...")
+                                
+                                # CORREÇÃO 2: Proteção contra "Buffer too small"
+                                # Só faz commit se enviamos dados suficientes (ex: > 1kb de base64)
+                                if bytes_sent_in_turn > 1000:
+                                    try:
+                                        await session_worker.connection.input_audio_buffer.commit()
+                                        logger.info("✅ Turno comitado com sucesso")
+                                    except Exception as e:
+                                        # Captura erro silenciosamente para não derrubar a conexão
+                                        logger.warning(f"⚠️ Commit ignorado: {e}")
+                                else:
+                                    logger.info("⏭️ Turno muito curto/ruído. Ignorando commit.")
+                                    # Opcional: Limpar buffer do Azure se possível, ou apenas ignorar
+                                    try: await session_worker.connection.input_audio_buffer.clear()
+                                    except: pass
+                                
                                 is_speaking = False
+                                bytes_sent_in_turn = 0
                             
-                            # Descarta o áudio da fila (é ruído/silêncio)
                             packet_queue.clear()
 
                 elif event_type == "start":
                     stream_sid = data["start"]["streamSid"]
+                    logger.info(f"📞 Stream iniciado (SID: {stream_sid})")
+                
                 elif event_type == "stop":
+                    logger.info("📞 Chamada encerrada")
                     break
                     
             except WebSocketDisconnect:
+                logger.info("🔌 WebSocket desconectado")
                 break
             except Exception as e:
-                logger.error(f"❌ Erro loop: {e}")
-                break
+                logger.error(f"❌ Erro loop principal: {e}")
+                # Não quebra o loop por erros menores
+                continue
 
     except Exception as e:
-        logger.critical(f"❌ Erro crítico: {e}")
+        logger.critical(f"❌ Erro crítico sessão: {e}", exc_info=True)
     finally:
         if session_worker: session_worker.shutdown()
         if session_task: session_task.cancel()
