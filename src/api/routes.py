@@ -2,7 +2,7 @@
 API Routes - Twilio Integration
 
 Adaptado para processar eventos JSON do Twilio Media Streams.
-Inclui pré-processamento com Silero VAD para filtragem de ruído em telefonia.
+Inclui pré-processamento com Silero VAD (com Buffering) para filtragem de ruído.
 """
 
 import asyncio
@@ -15,6 +15,7 @@ import audioop
 import numpy as np
 import torch
 from contextlib import asynccontextmanager
+from typing import List
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from supabase import create_client
@@ -122,7 +123,7 @@ async def root():
     return {"message": "Twilio Media Stream Ready", "docs": "/docs"}
 
 # ==============================================================================
-# WEBSOCKET - TWILIO MEDIA STREAMS (COM SILERO VAD)
+# WEBSOCKET - TWILIO MEDIA STREAMS (COM SILERO VAD BUFFERIZADO)
 # ==============================================================================
 @app.websocket("/ws/audio/{sip_number}")
 async def audio_stream(websocket: WebSocket, sip_number: str):
@@ -132,27 +133,28 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
     
     session_worker = None
     session_task = None
-    stream_sid = None  # ID da chamada na Twilio
+    stream_sid = None
     
     # --- CONFIGURAÇÃO DO VAD LOCAL ---
-    VAD_TIMEOUT_MS = 1500      # Tempo de silêncio para considerar fim de turno (1.5s)
-    SILENCE_THRESHOLD = 0.5    # Probabilidade mínima para considerar voz (0.0 a 1.0)
-    SAMPLE_RATE = 8000         # Taxa de amostragem do G.711 (Telefonia)
+    # Silero requer chunks exatos de 256, 512 ou 768 amostras para 8kHz
+    VAD_WINDOW_SAMPLES = 256   # 32ms (Mínimo suportado pelo Silero 8k)
+    VAD_WINDOW_BYTES = VAD_WINDOW_SAMPLES * 2  # 16-bit PCM = 2 bytes por amostra
+    
+    VAD_TIMEOUT_MS = 1500      # Tempo de silêncio para considerar fim de turno
+    SILENCE_THRESHOLD = 0.5    # Sensibilidade
+    SAMPLE_RATE = 8000         # Taxa Twilio G.711
     
     vad_model = None
     
     try:
-        # 1. Carregar Silero VAD
-        # O download ocorre na primeira execução e fica em cache
         logger.info("🧠 Carregando modelo Silero VAD...")
         vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
                                           model='silero_vad',
                                           force_reload=False,
                                           trust_repo=True)
-        # Desempacota utils apenas se necessário, mas para este caso uso básico basta o model
         logger.info("✅ Silero VAD carregado com sucesso")
 
-        # 2. Configuração do Cliente
+        # Configuração do Cliente
         client_manager = ClientManager(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
         client_config = client_manager.get_client_config(sip_number)
         
@@ -163,9 +165,8 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
 
         logger.info(f"✅ Config carregada. Iniciando worker...")
 
-        # 3. Callbacks adaptados para Twilio
+        # Callbacks
         async def send_audio_to_twilio(audio_data: bytes):
-            """Empacota áudio no formato JSON da Twilio"""
             if not stream_sid: return
             try:
                 payload = base64.b64encode(audio_data).decode('utf-8')
@@ -179,7 +180,6 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                 logger.error(f"❌ Erro envio Twilio: {e}")
 
         async def send_clear_buffer():
-            """Envia evento 'clear' para Twilio (Interrupção/Barge-in)"""
             if not stream_sid: return
             try:
                 await websocket.send_json({
@@ -189,7 +189,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                 logger.info("🛑 Buffer Twilio limpo (Interrupção)")
             except: pass
 
-        # 4. Inicializa Worker
+        # Inicializa Worker
         session_worker = VoiceAssistantWorker(
             agent_config=client_config,
             settings=settings,
@@ -198,81 +198,86 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
         )
         session_task = asyncio.create_task(session_worker.connect_and_run())
         
-        # Variáveis de Estado do VAD
+        # --- BUFFERS DE VAD ---
+        # vad_buffer: Acumula bytes PCM para completar a janela do VAD
+        vad_buffer = bytearray()
+        
+        # packet_queue: Acumula os payloads originais da Twilio enquanto bufferizamos o VAD
+        # Estrutura: List[str] (lista de payloads base64)
+        packet_queue: List[str] = []
+        
+        # Estado
         last_speech_time = 0.0
         speech_detected_flag = False
         
-        # 5. Loop de Processamento Twilio
+        # Loop Principal
         while True:
             try:
-                # Twilio envia TEXTO contendo JSON
                 message = await websocket.receive_text()
                 data = json.loads(message)
                 event_type = data.get("event")
 
                 if event_type == "media":
-                    # Extrai payload (G.711 u-law base64)
                     payload = data["media"]["payload"]
                     
                     if session_worker.connection:
                         try:
-                            # --- PRÉ-PROCESSAMENTO VAD ---
-                            
-                            # A. Decodifica Base64 para bytes puros (u-law)
+                            # 1. Decodificar e Converter
                             chunk_ulaw = base64.b64decode(payload)
-                            
-                            # B. Converte u-law para PCM 16-bit (Linear)
-                            # Silero precisa de PCM linear, não u-law comprimido
                             chunk_pcm = audioop.ulaw2lin(chunk_ulaw, 2)
                             
-                            # C. Prepara Tensor para o PyTorch
-                            # Normaliza int16 para float32 entre -1.0 e 1.0
-                            audio_float32 = np.frombuffer(chunk_pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                            tensor = torch.from_numpy(audio_float32)
+                            # 2. Adicionar aos Buffers
+                            vad_buffer.extend(chunk_pcm)
+                            packet_queue.append(payload)
                             
-                            # D. Executa detecção
-                            speech_prob = vad_model(tensor, SAMPLE_RATE).item()
-                            
-                            # --- LÓGICA DE GATE ---
-                            
-                            if speech_prob > SILENCE_THRESHOLD:
-                                # >> VOZ DETECTADA <<
+                            # 3. Processar VAD se tivermos dados suficientes
+                            # Processamos em janelas exatas de 256 amostras (512 bytes)
+                            while len(vad_buffer) >= VAD_WINDOW_BYTES:
                                 
-                                # Envia o payload original (G.711) para o Azure
-                                # Nota: O Azure recebe o áudio original, não o convertido
-                                await session_worker.connection.input_audio_buffer.append(audio=payload)
+                                # Extrai janela para análise
+                                window_pcm = vad_buffer[:VAD_WINDOW_BYTES]
+                                vad_buffer = vad_buffer[VAD_WINDOW_BYTES:] # Remove do buffer
                                 
-                                # Atualiza estado
-                                last_speech_time = time.time()
-                                if not speech_detected_flag:
-                                    speech_detected_flag = True
-                                    logger.info("🗣️ VAD Local: Fala detectada")
-                                    
+                                # Prepara Tensor
+                                audio_float32 = np.frombuffer(window_pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                                tensor = torch.from_numpy(audio_float32)
+                                
+                                # Executa VAD
+                                speech_prob = vad_model(tensor, SAMPLE_RATE).item()
+                                
+                                if speech_prob > SILENCE_THRESHOLD:
+                                    last_speech_time = time.time()
+                                    if not speech_detected_flag:
+                                        speech_detected_flag = True
+                                        logger.info("🗣️ VAD: Voz detectada")
+
+                            # 4. Decisão de Envio (Gate)
+                            # Se detectou voz recentemente (dentro do timeout), libera a fila
+                            current_time = time.time()
+                            is_active_speech = speech_detected_flag and (current_time - last_speech_time) * 1000 < VAD_TIMEOUT_MS
+                            
+                            if is_active_speech:
+                                # Envia todos os pacotes acumulados na fila
+                                while packet_queue:
+                                    p = packet_queue.pop(0)
+                                    await session_worker.connection.input_audio_buffer.append(audio=p)
                             else:
-                                # >> SILÊNCIO DETECTADO <<
-                                # Não envia nada para o Azure (economiza tokens e evita ruído)
-                                
-                                # Verifica Timeout de Silêncio para encerrar turno
-                                current_time = time.time()
-                                if speech_detected_flag and (current_time - last_speech_time) * 1000 > VAD_TIMEOUT_MS:
+                                # Se excedeu o timeout, fecha o turno e limpa fila
+                                if speech_detected_flag:
+                                    logger.info(f"🛑 VAD: Silêncio > {VAD_TIMEOUT_MS}ms. Fechando turno.")
+                                    # Limpa buffer do Azure para forçar resposta (commit implícito pelo silêncio)
+                                    # Dependendo da config do Azure VAD, pode precisar de um commit manual,
+                                    # mas parar de enviar áudio geralmente funciona se o threshold do Azure estiver baixo.
+                                    await session_worker.connection.input_audio_buffer.commit() 
                                     
-                                    logger.info(f"🛑 VAD Local: Silêncio > {VAD_TIMEOUT_MS}ms. Fechando turno.")
-                                    
-                                    # Força o Azure a processar o que ouviu até agora
-                                    # O 'clear' aqui pode ser usado se quiser limpar o buffer, 
-                                    # mas para comitar o áudio, o Azure geralmente usa o VAD dele.
-                                    # Como estamos simulando VAD, o Azure ficará esperando.
-                                    # Se o VAD do Azure estiver desligado (threshold 0.01), ele processa contínuo.
-                                    # Uma forma de forçar resposta é enviar um commit manual se a API permitir,
-                                    # ou confiar que o Azure VAD (configurado permissivo) vai processar o fluxo enviado.
-                                    
-                                    # Reset do flag
                                     speech_detected_flag = False
-                                    last_speech_time = 0.0
+                                
+                                # Limpa a fila de pacotes (descarta o ruído/silêncio)
+                                packet_queue.clear()
 
                         except Exception as e_vad:
-                            # Em caso de erro no VAD, fallback: envia áudio direto
-                            logger.error(f"⚠️ Erro VAD: {e_vad}")
+                            logger.error(f"⚠️ Erro VAD Loop: {e_vad}")
+                            # Fallback em caso de erro crítico: envia tudo
                             await session_worker.connection.input_audio_buffer.append(audio=payload)
                 
                 elif event_type == "start":
@@ -280,13 +285,13 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                     logger.info(f"📞 Stream iniciado (SID: {stream_sid})")
                 
                 elif event_type == "stop":
-                    logger.info("📞 Chamada encerrada pela Twilio")
+                    logger.info("📞 Chamada encerrada")
                     break
                     
             except WebSocketDisconnect:
                 break
             except Exception as e:
-                logger.error(f"❌ Erro processamento msg: {e}")
+                logger.error(f"❌ Erro processamento: {e}")
                 break
 
     except Exception as e:
