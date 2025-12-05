@@ -3,14 +3,6 @@ Voice Assistant Worker Service
 
 Core do Assistente: Gerencia Conexão, Sessão e Eventos do Azure VoiceLive.
 Adaptado para suportar telefonia (G.711 Mu-Law).
-
-Correções v2.2:
-- Removido código duplicado
-- Implementado grace period para proteção de saudação
-- Adicionado debouncing para eventos VAD
-- Melhorado logging e rastreamento de estados
-- NOVO: Limpeza de input_audio_buffer no barge-in
-- NOVO: Modo saudação para prevenir auto-resposta
 """
 
 import asyncio
@@ -56,13 +48,13 @@ class VoiceAssistantWorker:
         # Sistema de Estados
         self.is_agent_speaking = False
         self._greeting_sent_at = None
-        self._is_greeting_mode = False  # NOVO: Flag para modo saudação
+        self._is_greeting_mode = False 
         self._last_vad_event = 0
         
         # Configurações de Proteção
-        self._grace_period_seconds = getattr(settings, 'GREETING_GRACE_PERIOD_SECONDS', 2.0)
-        self._vad_debounce_ms = getattr(settings, 'VAD_DEBOUNCE_MS', 300)
-        self._greeting_delay = getattr(settings, 'GREETING_DELAY_SECONDS', 1.5)
+        self._grace_period_seconds = self.settings.GREETING_GRACE_PERIOD_SECONDS
+        self._vad_debounce_ms = self.settings.VAD_DEBOUNCE_MS
+        self._greeting_delay = self.settings.GREETING_DELAY_SECONDS
         
         logger.info(f"🚀 Worker inicializado | Env: {self.settings.APP_ENV} | Voz: {self.agent_config.voice}")
         logger.debug(f"🛡️ Proteções: Grace={self._grace_period_seconds}s | Debounce={self._vad_debounce_ms}ms | Delay={self._greeting_delay}s")
@@ -190,6 +182,8 @@ class VoiceAssistantWorker:
     def _should_process_vad_event(self) -> bool:
         """Debouncing para evitar processar eventos VAD repetitivos"""
         now = asyncio.get_event_loop().time() * 1000  # em ms
+        # Usamos o debouncing padrão se não houver um evento VAD próximo.
+        # O debouncing só deve ser usado em eventos muito próximos para filtrar ruído de linha.
         if (now - self._last_vad_event) < self._vad_debounce_ms:
             return False
         self._last_vad_event = now
@@ -209,7 +203,7 @@ class VoiceAssistantWorker:
                     logger.debug("🛡️ Grace period ativo - ignorando detecção de fala (proteção de saudação)")
                     continue
                 
-                # Proteção 2: Debouncing
+                # Proteção 2: Debouncing (filtro de ruído de linha)
                 if not self._should_process_vad_event():
                     logger.debug("⏭️ Evento VAD ignorado (debouncing - muito próximo do anterior)")
                     continue
@@ -226,11 +220,10 @@ class VoiceAssistantWorker:
                     if self.interruption_handler:
                         asyncio.create_task(self.interruption_handler())
 
-                    # 3. CORREÇÃO: Cancela resposta E limpa buffer de entrada
+                    # 3. Cancela resposta E limpa buffer de entrada (Non-Blocking)
                     asyncio.create_task(self._cancel_and_clear())
                     
-                    # Reseta o estado
-                    self.is_agent_speaking = False
+                    # CORREÇÃO: Removemos o reset manual. O estado deve ser resetado pelo RESPONSE_AUDIO_TRANSCRIPT_DONE.
                     
                 else:
                     logger.debug("👤 Usuário falando: Turno normal (Agente estava em silêncio).")
@@ -240,7 +233,7 @@ class VoiceAssistantWorker:
                 # Rastreamento de estado quando o agente começa a falar
                 if not self.is_agent_speaking:
                     self.is_agent_speaking = True
-                    logger.debug("🔊 Agente começou a falar")
+                    logger.debug("🔊 Agente começou a falar (Setting state=True)")
 
                 if self.audio_output_handler:
                     await self.audio_output_handler(event.delta)
@@ -257,9 +250,9 @@ class VoiceAssistantWorker:
                 
                 # Rastreamento de estado quando o agente termina de falar
                 self.is_agent_speaking = False
-                logger.debug("🔇 Agente terminou de falar")
+                logger.debug("🔇 Agente terminou de falar (Setting state=False)")
                 
-                # CORREÇÃO: Finaliza modo saudação após primeira transcrição
+                # Finaliza modo saudação após primeira transcrição
                 if self._is_greeting_mode:
                     self._is_greeting_mode = False
                     logger.debug("✅ Modo saudação finalizado")
@@ -270,7 +263,7 @@ class VoiceAssistantWorker:
             
             # ========== DETECÇÃO DE SILÊNCIO ==========
             elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
-                # CORREÇÃO: Ignora silêncio durante modo saudação
+                # Ignora silêncio durante modo saudação
                 if self._is_greeting_mode:
                     logger.debug("🚫 Modo saudação - ignorando detecção de silêncio")
                     continue
@@ -278,7 +271,7 @@ class VoiceAssistantWorker:
                 logger.info("🛑 Silêncio detectado (VAD) - Processando resposta...")
 
     async def _cancel_and_clear(self):
-        """NOVO: Cancela resposta E limpa buffer de entrada (barge-in completo)"""
+        """Cancela resposta E limpa buffer de entrada (barge-in completo)"""
         try:
             if self.connection:
                 await self.connection.response.cancel()
