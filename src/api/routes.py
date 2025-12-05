@@ -100,16 +100,16 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
     
     # --- CONFIGURAÇÃO VAD ---
     vad = webrtcvad.Vad(3)
-    FRAME_SIZE_BYTES = 320 # 20ms @ 8000Hz PCM16
+    FRAME_SIZE_BYTES = 320
     SAMPLE_RATE = 8000
+    VAD_TIMEOUT_MS = 1000
     
-    # Lógica de Silêncio
-    VAD_TIMEOUT_MS = 1000 
+    # --- PROTEÇÕES ---
+    AUDIO_IGNORE_SECONDS = 3.0  # Proteção inicial (Saudação)
+    POST_COMMIT_PAUSE = 2.0     # NOVO: Tempo que o ouvido fica "fechado" após falar
     
-    # CORREÇÃO 1: Tempo de aquecimento (Warmup)
-    # Ignora áudio nos primeiros 3 segundos para proteger a saudação e evitar ruído inicial
-    AUDIO_IGNORE_SECONDS = 3.0 
     start_time = time.time()
+    last_commit_time = 0.0      # NOVO: Rastreia último envio
     
     try:
         # Configuração do Cliente
@@ -167,6 +167,9 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                 if event_type == "media":
                     # CORREÇÃO 1: Ignora áudio durante período de warmup (saudação)
                     if (time.time() - start_time) < AUDIO_IGNORE_SECONDS:
+                        continue
+
+                    if (time.time() - last_commit_time) < POST_COMMIT_PAUSE:
                         continue
 
                     payload = data["media"]["payload"]
