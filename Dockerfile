@@ -62,4 +62,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["python", "src/healthcheck.py"]
 
-CMD ["python", "-m", "src.main"]
+CMD ["/bin/sh", "-c", "python -m src.main 2>&1 | grep --line-buffered -v 'NNPACK'"]
