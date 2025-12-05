@@ -11,6 +11,24 @@ from pydantic import ValidationError
 from src.core.config import get_settings
 from src.core.logging import setup_logging
 
+class StderrFilter:
+    """Filtra mensagens indesejadas do canal de erro padrão (stderr)"""
+    def __init__(self, original_stderr):
+        self.original_stderr = original_stderr
+
+    def write(self, message):
+        # Se a mensagem contiver o aviso chato do NNPACK, ignora
+        if "NNPACK" in message or "Unsupported hardware" in message:
+            return
+        # Caso contrário, escreve normalmente
+        self.original_stderr.write(message)
+
+    def flush(self):
+        self.original_stderr.flush()
+
+# Aplica o filtro imediatamente
+sys.stderr = StderrFilter(sys.stderr)
+
 # ==============================================================================
 # SETUP INICIAL
 # ==============================================================================
