@@ -25,11 +25,11 @@ services:
     networks:
       - voicelive-network
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s       # Aumente se necessário
+      timeout: 10s        # Dê tempo para a API responder sob carga
+      retries: 5          # Mais tentativas antes de declarar "morto"
+      start_period: 20s   # Tempo para o worker "acordar"
 
   # ===== STAGING =====
   voicelive-staging:
