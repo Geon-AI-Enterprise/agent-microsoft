@@ -14,31 +14,31 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
 
 from src.core.config import get_settings
+from src.services.transcoder import AudioTranscoder
 from src.services.voice_assistant import VoiceAssistantWorker
 from src.services.client_manager import ClientManager
-from src.services.transcoder import AudioTranscoder
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# ==============================================================================
-# LIFESPAN & SETUP
-# ==============================================================================
+app = FastAPI(title="Voice Agent API")
+
+client_manager = ClientManager(settings.DB_URL)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"🟢 STARTUP: {settings.APP_ENV.upper()}")
+    """
+    Controla inicialização e finalização de recursos da aplicação.
+    """
+    logger.info("🚀 Voice Agent API iniciando...")
     yield
-    logger.info("🔴 SHUTDOWN")
+    logger.info("🧹 Voice Agent API finalizando...")
 
-app = FastAPI(title="Azure VoiceLive Agent", lifespan=lifespan)
 
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "env": settings.APP_ENV}
+app.router.lifespan_context = lifespan
 
-# ==============================================================================
-# WEBSOCKET CONTROLLER
-# ==============================================================================
+
 @app.websocket("/ws/audio/{sip_number}")
 async def audio_stream(websocket: WebSocket, sip_number: str):
     """
@@ -57,43 +57,48 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
 
     try:
         # 1. Identificação do Cliente (Banco de Dados)
-        client_manager = ClientManager(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
-        client_config = client_manager.get_client_config(sip_number)
-
+        client_config = await client_manager.get_agent_config_by_sip(sip_number)
         if not client_config:
-            logger.warning(f"⚠️ Cliente não encontrado ou inativo: {sip_number}")
-            await websocket.close(code=4000)
+            logger.error(f"❌ Cliente não encontrado para o número: {sip_number}")
+            await websocket.close()
             return
 
-        # 2. Callback de Saída: Azure (24k) -> Transcoder -> Twilio (8k)
-        async def handle_azure_audio(audio_data_24k: str):
-            nonlocal stream_sid
-            if not stream_sid: return
-            
-            # Delega a conversão complexa para o Transcoder
-            payload_8k = transcoder.azure_to_twilio(audio_data_24k)
-            
-            if payload_8k:
-                try:
-                    await websocket.send_json({
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": payload_8k}
-                    })
-                except Exception as e:
-                    logger.warning(f"Falha envio WebSocket: {e}")
+        logger.info(f"👤 Cliente identificado: {client_config.name}")
 
-        # Callback de Interrupção
+        # 2. Configuração do Handler de Saída (Azure -> Twilio)
+        async def handle_azure_audio(pcm_24k: bytes):
+            """
+            Recebe áudio 24k PCM16 do Azure e envia para o Twilio em Mu-Law 8k.
+            """
+            try:
+                base64_chunk = transcoder.azure_to_twilio(pcm_24k)
+                if not base64_chunk:
+                    return
+
+                if not stream_sid:
+                    return
+
+                payload = {
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {
+                        "payload": base64_chunk
+                    }
+                }
+                await websocket.send_text(json.dumps(payload))
+            except Exception as e:
+                logger.error(f"Erro ao enviar áudio para Twilio: {e}")
+
         async def handle_interruption():
-            if not stream_sid: 
-                logger.warning("⚠️ Tentativa de limpar buffer sem Stream SID")
-                return
+            """
+            Limpa os buffers internos do Transcoder, garantindo que nenhum áudio residual
+            seja enviado após um barge-in.
+            """
             try:
                 transcoder.clear()
-                await websocket.send_json({
-                    "event": "clear", 
-                    "streamSid": stream_sid
-                })
+                await websocket.send_text(json.dumps({
+                    "event": "clear"
+                }))
                 logger.info("⚡ Buffer de áudio limpo (Barge-in)")
             except Exception as e:
                 logger.error(f"❌ Falha ao limpar buffer de áudio: {e}") 
@@ -109,16 +114,29 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
         # Inicia conexão em background
         worker_task = asyncio.create_task(session_worker.connect_and_run())
 
-        # 4. Loop Principal: Twilio (8k) -> Transcoder -> Azure (24k)
+        # 4. Loop principal do WebSocket com Twilio
         while True:
             try:
                 message = await websocket.receive_text()
                 data = json.loads(message)
                 event_type = data.get("event")
 
-                if event_type == "media":
+                if event_type == "start":
+                    stream_sid = data["start"]["streamSid"]
+                    logger.info(f"▶️ Stream iniciado: {stream_sid}")
+
+                elif event_type == "media":
                     # Extrai payload bruto (Mu-Law 8k)
                     raw_payload = data["media"]["payload"]
+
+                    # 🔥 BARGE-IN ANTECIPADO:
+                    # Se o agente estiver falando e chegar mídia nova do usuário,
+                    # disparamos a interrupção imediatamente (sem esperar VAD do Azure)
+                    if session_worker and session_worker.is_agent_speaking:
+                        try:
+                            await session_worker.trigger_barge_in()
+                        except Exception as e:
+                            logger.warning(f"⚠️ Falha ao acionar barge-in pelo lado Twilio: {e}")
                     
                     # Delega conversão/limpeza para o Transcoder
                     clean_24k_payload = transcoder.twilio_to_azure(raw_payload)
@@ -127,16 +145,12 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                     if clean_24k_payload and session_worker.connection:
                         await session_worker.ingest_audio(clean_24k_payload)
 
-                elif event_type == "start":
-                    stream_sid = data["start"]["streamSid"]
-                    logger.info(f"📞 Stream iniciado (SID: {stream_sid})")
-                
                 elif event_type == "stop":
-                    logger.info("📞 Chamada finalizada pelo Twilio")
+                    logger.info("⏹️ Stream finalizado pelo Twilio")
                     break
-                    
+
             except WebSocketDisconnect:
-                logger.info("🔌 WebSocket desconectado")
+                logger.info(f"🔌 Conexão encerrada para o número: {sip_number}")
                 break
             except Exception as e:
                 # Erros de JSON ou protocolo não devem derrubar o servidor
@@ -152,5 +166,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
             session_worker.shutdown()
         if worker_task: 
             worker_task.cancel()
-            try: await worker_task 
-            except: pass
+            try:
+                await worker_task 
+            except Exception:
+                pass
