@@ -30,7 +30,13 @@ class AudioTranscoder:
         # Output desejado: 160 bytes (u-law) -> 160 samples
         # Conversão taxa: 160 samples * (24000/8000) = 480 samples (source)
         # Bytes source: 480 samples * 2 bytes width = 960 bytes
-        self.MIN_CHUNK_SIZE = 960 
+        self.MIN_CHUNK_SIZE = 960
+
+    def clear(self):
+        """Limpa buffers internos imediatamente (Barge-in)"""
+        self._azure_accumulator = b""
+        self._state_out = None
+        logger.debug("🧹 Transcoder buffer limpo")
 
     def twilio_to_azure(self, base64_payload: Union[str, bytes]) -> Optional[str]:
         """Twilio (Mu-Law 8k) -> Azure (PCM16 24k)"""

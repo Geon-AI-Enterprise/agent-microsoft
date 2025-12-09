@@ -87,6 +87,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
         async def handle_interruption():
             if not stream_sid: return
             try:
+                transcoder.clear()
                 await websocket.send_json({
                     "event": "clear", 
                     "streamSid": stream_sid

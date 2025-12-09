@@ -58,6 +58,7 @@ class VoiceAssistantWorker:
         self.audio_processor = None
         self._shutdown_event = asyncio.Event()
         self.is_agent_speaking = False
+        self._ignore_deltas = False
         
         # Controles de fluxo
         self._is_greeting_mode = False
@@ -180,6 +181,8 @@ class VoiceAssistantWorker:
                 if self.is_agent_speaking:
                     logger.info("⚡ BARGE-IN DETECTADO: Interrompendo agente...")
                     self.is_agent_speaking = False
+
+                    self._ignore_deltas = True
                     
                     # 1. Cancela a resposta do Azure IMEDIATAMENTE
                     await self.connection.response.cancel()
@@ -198,11 +201,16 @@ class VoiceAssistantWorker:
                 logger.info("🤫 [Azure] Usuário parou de falar")
                 if self._is_greeting_mode:
                     self._is_greeting_mode = False
+            elif event.type == ServerEventType.RESPONSE_CREATED:
+                self._ignore_deltas = False
 
             # ------------------------------------------------------------------
             # ÁUDIO DO AGENTE (OUTPUT)
             # ------------------------------------------------------------------
             elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
+                if self._ignore_deltas:
+                    continue
+                
                 if not self.is_agent_speaking:
                     self.is_agent_speaking = True
                 
