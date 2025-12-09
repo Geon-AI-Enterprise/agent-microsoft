@@ -189,7 +189,7 @@ class VoiceAssistantWorker:
                     
                     # 2. Limpa o buffer do Twilio/Cliente
                     if self.interruption_handler:
-                        asyncio.create_task(self.interruption_handler())
+                        await self.interruption_handler()
                     
                     if self.audio_processor:
                         self.audio_processor.skip_pending_audio()
@@ -210,7 +210,7 @@ class VoiceAssistantWorker:
             elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
                 if self._ignore_deltas:
                     continue
-                
+
                 if not self.is_agent_speaking:
                     self.is_agent_speaking = True
                 

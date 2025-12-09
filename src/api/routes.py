@@ -85,15 +85,18 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
 
         # Callback de Interrupção
         async def handle_interruption():
-            if not stream_sid: return
+            if not stream_sid: 
+                logger.warning("⚠️ Tentativa de limpar buffer sem Stream SID")
+                return
             try:
                 transcoder.clear()
                 await websocket.send_json({
                     "event": "clear", 
                     "streamSid": stream_sid
                 })
-            except Exception: 
-                pass
+                logger.info("⚡ Buffer de áudio limpo (Barge-in)")
+            except Exception as e:
+                logger.error(f"❌ Falha ao limpar buffer de áudio: {e}") 
 
         # 3. Inicializa o Worker do Azure (Inteligência)
         session_worker = VoiceAssistantWorker(
