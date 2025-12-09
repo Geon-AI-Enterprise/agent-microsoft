@@ -41,11 +41,11 @@ class VoiceAssistantWorker:
     """
 
     def __init__(
-        self, 
-        agent_config: AgentConfig, 
-        settings=None, 
-        audio_output_handler: Optional[Callable[[bytes], Awaitable[None]]] = None, 
-        interruption_handler: Optional[Callable[[], Awaitable[None]]] = None
+        self,
+        agent_config: AgentConfig,
+        settings=None,
+        audio_output_handler: Optional[Callable[[bytes], Awaitable[None]]] = None,
+        interruption_handler: Optional[Callable[[], Awaitable[None]]] = None,
     ):
         self.settings = settings or get_settings()
         self.agent_config = agent_config
@@ -54,52 +54,77 @@ class VoiceAssistantWorker:
         # Handlers externos (injeção de dependência)
         self.audio_output_handler = audio_output_handler
         self.interruption_handler = interruption_handler
-        
+
         # Estado interno
         self.audio_processor = None
         self._shutdown_event = asyncio.Event()
         self.is_agent_speaking = False
         self._ignore_deltas = False
-        
+
         # Controles de fluxo
         self._is_greeting_mode = False
-        self._greeting_sent_at = 0
-        
+        self._greeting_sent_at = 0.0
+
         # Configurações de latência e proteção
-        self._greeting_delay = self.settings.GREETING_DELAY_SECONDS or 1.0
-        
+        # Usa GREETING_DELAY_SECONDS, com fallback para 1.0s se não existir
+        self._greeting_delay = getattr(self.settings, "GREETING_DELAY_SECONDS", 1.0)
+
         logger.info(f"🚀 Worker inicializado | Voz: {self.agent_config.voice}")
 
     async def trigger_barge_in(self) -> None:
         """
-        Interrompe o agente imediatamente (Barge-in), reutilizado por:
+        Interrompe o agente imediatamente (Barge-in).
+
+        Reutilizado por:
         - Eventos de VAD do Azure (INPUT_AUDIO_BUFFER_SPEECH_STARTED)
         - Detecção antecipada no lado Twilio (chegada de mídia enquanto o agente fala)
         """
-        if not self.is_agent_speaking:
+
+        # Se não há conexão ativa, não há o que fazer
+        if not self.connection:
             return
 
-        logger.info("⚡ BARGE-IN: Interrompendo agente em andamento...")
+        # Se já não está falando e não estamos ignorando deltas,
+        # provavelmente não há nada para interromper
+        if not self.is_agent_speaking and not self._ignore_deltas:
+            return
 
-        # Marca que o agente não está mais falando e ignora qualquer delta remanescente
+        logger.info(
+            f"⚡ BARGE-IN: Interrompendo agente "
+            f"(is_agent_speaking={self.is_agent_speaking}, ignore_deltas={self._ignore_deltas})"
+        )
+
+        # Marca estado local: paramos de considerar que o agente está falando
+        # e passamos a ignorar qualquer delta remanescente dessa resposta
         self.is_agent_speaking = False
         self._ignore_deltas = True
 
-        # Cancela a resposta atual no Azure (se houver)
+        # 1) Limpa buffer de saída no Azure (corta áudio já gerado mas ainda não enviado)
         try:
-            if self.connection and self.connection.response:
-                await self.connection.response.cancel()
+            output_buffer = getattr(self.connection, "output_audio_buffer", None)
+            if output_buffer is not None:
+                await output_buffer.clear()
+                logger.info("🧹 Azure output_audio_buffer.clear() chamado com sucesso")
+        except Exception as e:
+            logger.warning(f"⚠️ Erro ao limpar output_audio_buffer no Azure: {e}")
+
+        # 2) Cancela a resposta atual no Azure
+        try:
+            response_resource = getattr(self.connection, "response", None)
+            if response_resource is not None:
+                await response_resource.cancel()
+                logger.info("⛔ Azure response.cancel() enviado com sucesso")
         except Exception as e:
             logger.warning(f"⚠️ Erro ao cancelar resposta no Azure durante barge-in: {e}")
 
-        # Limpa buffers do lado do cliente/Twilio
+        # 3) Limpa buffers do lado do cliente/Twilio
         try:
             if self.interruption_handler:
                 await self.interruption_handler()
         except Exception as e:
             logger.warning(f"⚠️ Erro ao executar interruption_handler durante barge-in: {e}")
 
-        # Limpa qualquer áudio pendente no processador local (dev)
+        # 4) Limpa qualquer áudio pendente no processador local (dev)
         try:
             if self.audio_processor:
                 self.audio_processor.skip_pending_audio()
@@ -113,7 +138,7 @@ class VoiceAssistantWorker:
         """
         try:
             # 1. Configuração de Credenciais
-            if self.settings.AZURE_VOICELIVE_API_KEY:
+            if getattr(self.settings, "AZURE_VOICELIVE_API_KEY", None):
                 cred = AzureKeyCredential(self.settings.AZURE_VOICELIVE_API_KEY)
             else:
                 cred = DefaultAzureCredential()
@@ -122,13 +147,13 @@ class VoiceAssistantWorker:
             async with connect(
                 endpoint=self.settings.AZURE_VOICELIVE_ENDPOINT,
                 credential=cred,
-                model=self.settings.AZURE_VOICELIVE_MODEL
+                model=self.settings.AZURE_VOICELIVE_MODEL,
             ) as conn:
                 self.connection = conn
                 logger.info("✅ Conexão estabelecida com sucesso")
 
                 # 2. Inicialização de Áudio Local (Apenas Dev/Local)
-                if self.settings.is_development() and AUDIO_AVAILABLE:
+                if getattr(self.settings, "is_development", lambda: False)() and AUDIO_AVAILABLE:
                     self._setup_local_audio(conn)
 
                 # 3. Configura a Sessão (PCM16 para estabilidade)
@@ -141,7 +166,7 @@ class VoiceAssistantWorker:
                 await self._process_events()
 
         except Exception as e:
-            logger.error(f"Erro crítico na conexão com Azure VoiceLive: {e}", exc_info=True)
+            logger.error(f"❌ Erro crítico na conexão com Azure VoiceLive: {e}", exc_info=True)
         finally:
             await self._cleanup()
 
@@ -166,12 +191,12 @@ class VoiceAssistantWorker:
 
         voice = AzureStandardVoice(
             name=self.agent_config.voice,
-            role="assistant"
+            role="assistant",
         )
 
         vad = ServerVad(
             enable_vad=True,
-            noise_suppression_level="high"
+            noise_suppression_level="high",
         )
 
         session = RequestSession(
@@ -179,13 +204,13 @@ class VoiceAssistantWorker:
             assistant_voice=voice,
             input_audio_format=InputAudioFormat(
                 encoding="pcm16",
-                sample_rate_hz=24000
+                sample_rate_hz=24000,
             ),
             output_audio_format=OutputAudioFormat(
                 encoding="pcm16",
-                sample_rate_hz=24000
+                sample_rate_hz=24000,
             ),
-            vad=vad
+            vad=vad,
         )
 
         await self.connection.session.configure(session)
@@ -198,7 +223,7 @@ class VoiceAssistantWorker:
         """
         Dispara uma saudação inicial, se configurado no AgentConfig.
         """
-        if not self.agent_config.greeting:
+        if not getattr(self.agent_config, "greeting", None):
             return
 
         await asyncio.sleep(self._greeting_delay)
@@ -211,7 +236,7 @@ class VoiceAssistantWorker:
             logger.info("💬 Enviando saudação inicial...")
 
             await self.connection.request.send(
-                input_text=self.agent_config.greeting
+                input_text=self.agent_config.greeting,
             )
         except Exception as e:
             logger.error(f"Erro ao enviar saudação inicial: {e}")
@@ -251,11 +276,13 @@ class VoiceAssistantWorker:
             # ------------------------------------------------------------------
             elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
                 if self._ignore_deltas:
+                    # Útil para debug: mostra que o barge-in está cortando áudio
+                    logger.debug("🔇 Delta de áudio do agente ignorado devido a barge-in")
                     continue
 
                 if not self.is_agent_speaking:
                     self.is_agent_speaking = True
-                
+
                 if self.audio_output_handler:
                     await self.audio_output_handler(event.delta)
                 elif self.audio_processor:
@@ -273,7 +300,7 @@ class VoiceAssistantWorker:
                     self.is_agent_speaking = False
                     self._is_greeting_mode = False
 
-                # Ao final do transcript, liberamos novamente os deltas para futuras respostas
+                # Ao final do transcript, liberamos novamente os deltas
                 self._ignore_deltas = False
 
             elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
@@ -292,9 +319,10 @@ class VoiceAssistantWorker:
         """
         if not self.connection:
             return
-        
+
         try:
-            await self.connection.input_audio.send(audio_chunk)
+            await self.connection.input_audio_buffer.append(audio_chunk)
+            await self.connection.input_audio_buffer.commit()
         except Exception as e:
             logger.error(f"Erro ao enviar áudio de entrada para Azure: {e}")
 
@@ -317,7 +345,7 @@ class VoiceAssistantWorker:
             except Exception:
                 pass
 
-        logger.info("🧹 Worker finalizado com sucesso")
+        logger.info("👋 Worker finalizado com sucesso")
 
     def shutdown(self):
         """
