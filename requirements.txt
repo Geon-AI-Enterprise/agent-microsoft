@@ -10,3 +10,4 @@ pydantic-settings
 supabase
 aiohttp
 requests
+audioop

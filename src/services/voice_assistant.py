@@ -2,7 +2,7 @@
 Voice Assistant Worker Service - Production Ready
 
 Core do Assistente: Gerencia Conexão, Sessão e Eventos do Azure VoiceLive.
-Otimizado para arquitetura baseada em WebSocket (Twilio/EasyPanel).
+Otimizado para arquitetura baseada em WebSocket (Twilio/EasyPanel) com Transcoding.
 """
 
 import asyncio
@@ -91,11 +91,10 @@ class VoiceAssistantWorker:
                 logger.info("✅ Conexão estabelecida com sucesso")
 
                 # 2. Inicialização de Áudio Local (Apenas Dev/Local)
-                # Em produção (EasyPanel), isso é ignorado para economizar recursos
                 if self.settings.is_development() and AUDIO_AVAILABLE:
                     self._setup_local_audio(conn)
 
-                # 3. Configura a Sessão (VAD, Voz, Instruções)
+                # 3. Configura a Sessão (PCM16 para estabilidade)
                 await self._configure_session()
 
                 # 4. Inicia Saudação (Em background para não bloquear)
@@ -107,7 +106,6 @@ class VoiceAssistantWorker:
         except asyncio.CancelledError:
             logger.info("🛑 Worker cancelado (Shutdown normal)")
         except Exception as e:
-            # Em produção, loga o erro mas evita crashar o container inteiro
             logger.error(f"❌ Erro na conexão do Worker: {e}", exc_info=self.settings.is_development())
         finally:
             self.connection = None
@@ -117,71 +115,27 @@ class VoiceAssistantWorker:
 
     async def ingest_audio(self, base64_audio: str):
         """
-        Método seguro para receber áudio do WebSocket (Twilio) e enviar para o Azure.
-        Não bloqueia e trata falhas de envio silenciosamente.
+        Método seguro para receber áudio (já convertido para 24k) do WebSocket.
         """
         if not self.connection:
             return
 
         try:
-            # Envia para o buffer do Azure.
-            # O Server VAD do Azure decidirá se é voz ou ruído.
+            # Envia para o buffer do Azure
             await self.connection.input_audio_buffer.append(audio=base64_audio)
         except Exception as e:
-            # Logs de debug para não poluir produção com erros de rede temporários
             logger.debug(f"⚠️ Falha ao ingerir áudio: {e}")
 
     async def _configure_session(self):
-        """Configura parâmetros da sessão para Telefonia (G.711 Mu-Law)"""
+        """
+        Configura sessão usando PCM16 (24kHz).
+        O Azure VAD funciona perfeitamente neste formato.
+        A conversão 8k <-> 24k é responsabilidade do routes.py.
+        """
         
-        # --- CORREÇÃO CRÍTICA PARA CHIADO ---
-        # Twilio usa G.711 Mu-Law (8kHz).
-        # Devemos informar isso ao Azure para que ele faça a conversão nativa.
-        # Se usarmos PCM16 aqui com áudio do Twilio, teremos apenas ruído estático.
-        
-        # Tenta usar o enum correto. Se a lib for antiga, usa string.
-        try:
-            input_fmt = InputAudioFormat.G711_ULAW
-            output_fmt = OutputAudioFormat.G711_ULAW
-        except AttributeError:
-            # Fallback caso o nome do enum seja diferente na versão da lib
-            logger.warning("⚠️ Enum G711_ULAW não encontrado, tentando string 'g711_ulaw'")
-            input_fmt = "g711_ulaw"
-            output_fmt = "g711_ulaw"
-
-        # Recupera configs com fallback seguro
-        turn_config = self.agent_config.config.get('turn_detection', {})
-        threshold = self.settings.VAD_THRESHOLD or turn_config.get('threshold', 0.5)
-        silence_ms = self.settings.VAD_SILENCE_DURATION_MS or turn_config.get('silence_duration_ms', 500)
-        prefix_ms = self.settings.VAD_PREFIX_PADDING_MS or turn_config.get('prefix_padding_ms', 300)
-
-        vad_config = ServerVad(
-            threshold=threshold,
-            prefix_padding_ms=prefix_ms,
-            silence_duration_ms=silence_ms
-        )
-
-        session_config = RequestSession(
-            modalities=[Modality.TEXT, Modality.AUDIO],
-            instructions=self.agent_config.instructions,
-            voice=AzureStandardVoice(name=self.agent_config.voice),
-            input_audio_format=input_fmt,   # <--- AQUI ESTÁ A MÁGICA
-            output_audio_format=output_fmt, # <--- E AQUI
-            turn_detection=vad_config,
-            temperature=self.settings.MODEL_TEMPERATURE or self.agent_config.temperature,
-            max_response_output_tokens=self.settings.MAX_RESPONSE_OUTPUT_TOKENS or self.agent_config.max_tokens
-        )
-        
-        await self.connection.session.update(session=session_config)
-        logger.info(f"⚙️ Sessão configurada: G.711 Mu-Law (Twilio Mode) | VAD(t={threshold})")
-        """Configura parâmetros da sessão baseados no Env e Config"""
-        
-        # Definição de formatos de áudio
-        # Para Twilio geralmente é G711_ULAW ou PCM16 dependendo da conversão no routes.py
-        # Aqui assumimos que routes.py já tratou ou estamos usando o padrão seguro
         input_fmt = InputAudioFormat.PCM16
         output_fmt = OutputAudioFormat.PCM16
-        
+
         # Recupera configs com fallback seguro
         turn_config = self.agent_config.config.get('turn_detection', {})
         threshold = self.settings.VAD_THRESHOLD or turn_config.get('threshold', 0.5)
@@ -206,7 +160,7 @@ class VoiceAssistantWorker:
         )
         
         await self.connection.session.update(session=session_config)
-        logger.info(f"⚙️ Sessão configurada: VAD(t={threshold}, s={silence_ms}ms)")
+        logger.info(f"⚙️ Sessão configurada: PCM16 24kHz (Transcoding Ativo) | VAD(t={threshold})")
 
     async def _process_events(self):
         """
@@ -228,11 +182,9 @@ class VoiceAssistantWorker:
                     self.is_agent_speaking = False
                     
                     # 1. Cancela a resposta do Azure IMEDIATAMENTE
-                    # Isso impede que a IA continue processando o que ia dizer
                     await self.connection.response.cancel()
                     
                     # 2. Limpa o buffer do Twilio/Cliente
-                    # Isso corta o áudio que já estava na fila para ser tocado no telefone
                     if self.interruption_handler:
                         asyncio.create_task(self.interruption_handler())
                     
@@ -243,9 +195,7 @@ class VoiceAssistantWorker:
             # FIM DA FALA DO USUÁRIO
             # ------------------------------------------------------------------
             elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
-                logger.info("🤫 [Azure] Usuário parou de falar (Processando resposta...)")
-                
-                # Se estávamos em modo saudação e o usuário falou, saímos do modo
+                logger.info("🤫 [Azure] Usuário parou de falar")
                 if self._is_greeting_mode:
                     self._is_greeting_mode = False
 
@@ -253,15 +203,11 @@ class VoiceAssistantWorker:
             # ÁUDIO DO AGENTE (OUTPUT)
             # ------------------------------------------------------------------
             elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
-                # Recebendo chunks de áudio da IA
                 if not self.is_agent_speaking:
                     self.is_agent_speaking = True
                 
-                # Envia para o WebSocket (Twilio)
                 if self.audio_output_handler:
                     await self.audio_output_handler(event.delta)
-                
-                # Ou toca localmente (Dev)
                 elif self.audio_processor:
                     self.audio_processor.queue_audio(event.delta)
 
@@ -271,9 +217,7 @@ class VoiceAssistantWorker:
             elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
                 logger.info(f"🤖 Agente disse: {event.transcript}")
                 self.is_agent_speaking = False
-                
-                if self._is_greeting_mode:
-                    self._is_greeting_mode = False
+                self._is_greeting_mode = False
 
             elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
                 logger.info(f"👤 Transcrição usuário: {event.transcript}")
@@ -282,7 +226,7 @@ class VoiceAssistantWorker:
                 logger.error(f"❌ Erro Azure: {event.error.message}")
 
     async def _send_initial_greeting(self):
-        """Envia saudação inicial com proteções de timing"""
+        """Envia saudação inicial"""
         try:
             self._is_greeting_mode = True
             await asyncio.sleep(self._greeting_delay)
@@ -291,7 +235,6 @@ class VoiceAssistantWorker:
                 return
 
             logger.info("👋 Enviando saudação inicial...")
-            # Força o modelo a gerar a saudação baseada nas instruções
             await self.connection.response.create(
                 response={
                     "instructions": "Diga sua saudação inicial definida nas instruções agora de forma natural."

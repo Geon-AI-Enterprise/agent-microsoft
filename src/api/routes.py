@@ -1,28 +1,23 @@
 """
-API Routes - Twilio Integration (Refatorado para Estabilidade)
-
-Mudanças Críticas:
-1. Remoção do VAD local (webrtcvad) dentro do loop de recebimento.
-   Motivo: O VAD local bloqueia o event loop em alta escala. Deixe o Azure lidar com VAD.
-2. Gerenciamento de Tasks mais robusto para evitar "zombie tasks".
-3. Tratamento de exceções específico para WebSocketDisconnect.
+API Routes - Twilio Integration com Transcoding (8kHz <-> 24kHz)
+Corrige: Erro de Sample Rate e Falha de Interrupção
 """
 
 import asyncio
 import base64
 import json
 import logging
+import audioop
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
 
-from src.core.config import get_settings, AgentConfig
+from src.core.config import get_settings
 from src.services.voice_assistant import VoiceAssistantWorker
 from src.services.client_manager import ClientManager
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# --- Gerenciamento de Lifespan (Mantido) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"🟢 STARTUP: {settings.APP_ENV.upper()}")
@@ -35,49 +30,63 @@ app = FastAPI(title="Azure VoiceLive Agent", lifespan=lifespan)
 async def health_check():
     return {"status": "ok", "env": settings.APP_ENV}
 
-# --- WebSocket Otimizado ---
 @app.websocket("/ws/audio/{sip_number}")
 async def audio_stream(websocket: WebSocket, sip_number: str):
     await websocket.accept()
-    logger.info(f"🔌 Conexão Twilio iniciada: {sip_number}")
+    logger.info(f"🔌 Conexão Twilio: {sip_number}")
 
     session_worker = None
     worker_task = None
     stream_sid = None
+    
+    # Estados para Transcoding (audioop)
+    # state_in: mantem estado do filtro de upsampling
+    # state_out: mantem estado do filtro de downsampling
+    state_in = None  
+    state_out = None
 
     try:
-        # 1. Configuração do Cliente (Rápida)
-        # Nota: Se o Supabase demorar, isso pode causar timeout no Twilio.
-        # Idealmente, use cache agressivo no ClientManager.
+        # 1. Busca Configuração
         client_manager = ClientManager(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
         client_config = client_manager.get_client_config(sip_number)
 
         if not client_config:
-            logger.warning(f"⚠️ Cliente não encontrado ou inativo: {sip_number}")
+            logger.warning(f"⚠️ Cliente não encontrado: {sip_number}")
             await websocket.close(code=4000)
             return
 
-        # 2. Callbacks de Áudio (Definidos para serem Non-Blocking)
-        async def send_audio_to_twilio(audio_data: bytes):
+        # 2. Callback de Saída (Azure 24k -> Twilio 8k)
+        async def send_audio_to_twilio(audio_data_24k: bytes):
+            nonlocal state_out, stream_sid
             if not stream_sid: return
+            
             try:
-                # Codificação Base64 é rápida, mas em alta escala considere threads separadas se notar lag
-                payload = base64.b64encode(audio_data).decode('utf-8')
+                # Decodifica Base64 do Azure (PCM16 24kHz)
+                pcm_24k = base64.b64decode(audio_data_24k)
+                
+                # Downsample: 24000 -> 8000
+                # audioop.ratecv(fragment, width, nchannels, inrate, outrate, state)
+                pcm_8k, state_out = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, state_out)
+                
+                # Converte PCM 8k -> Mu-Law
+                ulaw_8k = audioop.lin2ulaw(pcm_8k, 2)
+                
+                # Codifica para enviar ao Twilio
+                payload = base64.b64encode(ulaw_8k).decode('utf-8')
+                
                 await websocket.send_json({
                     "event": "media",
                     "streamSid": stream_sid,
                     "media": {"payload": payload}
                 })
             except Exception as e:
-                logger.debug(f"Falha ao enviar áudio Twilio: {e}")
+                logger.error(f"Erro transcoding OUT: {e}")
 
         async def send_clear_buffer():
             if not stream_sid: return
             try:
-                # O comando 'clear' é crucial para a interrupção funcionar bem no Twilio
                 await websocket.send_json({"event": "clear", "streamSid": stream_sid})
-            except Exception:
-                pass
+            except: pass
 
         # 3. Inicializa Worker
         session_worker = VoiceAssistantWorker(
@@ -86,12 +95,9 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
             audio_output_handler=send_audio_to_twilio,
             interruption_handler=send_clear_buffer
         )
-        
-        # Inicia a conexão com Azure em background
         worker_task = asyncio.create_task(session_worker.connect_and_run())
 
-        # 4. Loop Principal (Simplificado e Otimizado)
-        # Removemos o VAD local pesado. Enviamos tudo para o Azure processar.
+        # 4. Loop de Entrada (Twilio 8k -> Azure 24k)
         while True:
             try:
                 message = await websocket.receive_text()
@@ -99,52 +105,36 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                 event_type = data.get("event")
 
                 if event_type == "media":
-                    # Extrai payload
                     payload = data["media"]["payload"]
                     
-                    # Envia diretamente para o Azure (Fire and Forget)
-                    # O Worker deve lidar com o buffer interno
                     if session_worker.connection:
-                        # append é async, mas aqui usamos create_task ou await rápido
-                        # para não bloquear a leitura do próximo pacote Twilio
-                        await session_worker.ingest_audio(payload)
+                        # Decodifica Base64 Twilio (Mu-Law 8k)
+                        ulaw_8k = base64.b64decode(payload)
+                        
+                        # Converte Mu-Law -> PCM 8k
+                        pcm_8k = audioop.ulaw2lin(ulaw_8k, 2)
+                        
+                        # Upsample: 8000 -> 24000
+                        pcm_24k, state_in = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, state_in)
+                        
+                        # Codifica para Base64 (Azure espera string base64)
+                        base64_24k = base64.b64encode(pcm_24k).decode('utf-8')
+                        
+                        # Envia para Azure
+                        await session_worker.ingest_audio(base64_24k)
 
                 elif event_type == "start":
                     stream_sid = data["start"]["streamSid"]
-                    logger.info(f"📞 Stream SID: {stream_sid}")
-
                 elif event_type == "stop":
-                    logger.info("📞 Chamada encerrada pelo Twilio")
                     break
-                
-                elif event_type == "mark":
-                    # Eventos de marcação (opcional: logs)
-                    pass
-
+                    
             except WebSocketDisconnect:
-                logger.info("🔌 WebSocket desconectado pelo cliente")
                 break
-            except Exception as e:
-                logger.error(f"❌ Erro no loop WebSocket: {e}")
+            except Exception:
                 break
 
     except Exception as e:
-        logger.critical(f"❌ Erro crítico na sessão: {e}")
-    
+        logger.critical(f"❌ Erro sessão: {e}")
     finally:
-        # Limpeza Robusta
-        logger.info(f"🧹 Limpando sessão {sip_number}")
-        if session_worker:
-            session_worker.shutdown()
-        
-        if worker_task:
-            worker_task.cancel()
-            try:
-                await worker_task
-            except asyncio.CancelledError:
-                pass
-        
-        try:
-            await websocket.close()
-        except:
-            pass
+        if session_worker: session_worker.shutdown()
+        if worker_task: worker_task.cancel()
