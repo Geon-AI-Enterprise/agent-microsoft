@@ -13,8 +13,8 @@
         "silence_duration_ms": 200
     },
     "audio": {
-        "input_format": "PCM16",
-        "output_format": "PCM16",
+        "input_format": "g711_ulaw",
+        "output_format": "g711_ulaw",
         "echo_cancellation": true,
         "noise_reduction": "azure_deep_noise_suppression"
     },

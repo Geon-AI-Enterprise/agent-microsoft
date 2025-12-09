@@ -132,6 +132,48 @@ class VoiceAssistantWorker:
             logger.debug(f"⚠️ Falha ao ingerir áudio: {e}")
 
     async def _configure_session(self):
+        """Configura parâmetros da sessão para Telefonia (G.711 Mu-Law)"""
+        
+        # --- CORREÇÃO CRÍTICA PARA CHIADO ---
+        # Twilio usa G.711 Mu-Law (8kHz).
+        # Devemos informar isso ao Azure para que ele faça a conversão nativa.
+        # Se usarmos PCM16 aqui com áudio do Twilio, teremos apenas ruído estático.
+        
+        # Tenta usar o enum correto. Se a lib for antiga, usa string.
+        try:
+            input_fmt = InputAudioFormat.G711_ULAW
+            output_fmt = OutputAudioFormat.G711_ULAW
+        except AttributeError:
+            # Fallback caso o nome do enum seja diferente na versão da lib
+            logger.warning("⚠️ Enum G711_ULAW não encontrado, tentando string 'g711_ulaw'")
+            input_fmt = "g711_ulaw"
+            output_fmt = "g711_ulaw"
+
+        # Recupera configs com fallback seguro
+        turn_config = self.agent_config.config.get('turn_detection', {})
+        threshold = self.settings.VAD_THRESHOLD or turn_config.get('threshold', 0.5)
+        silence_ms = self.settings.VAD_SILENCE_DURATION_MS or turn_config.get('silence_duration_ms', 500)
+        prefix_ms = self.settings.VAD_PREFIX_PADDING_MS or turn_config.get('prefix_padding_ms', 300)
+
+        vad_config = ServerVad(
+            threshold=threshold,
+            prefix_padding_ms=prefix_ms,
+            silence_duration_ms=silence_ms
+        )
+
+        session_config = RequestSession(
+            modalities=[Modality.TEXT, Modality.AUDIO],
+            instructions=self.agent_config.instructions,
+            voice=AzureStandardVoice(name=self.agent_config.voice),
+            input_audio_format=input_fmt,   # <--- AQUI ESTÁ A MÁGICA
+            output_audio_format=output_fmt, # <--- E AQUI
+            turn_detection=vad_config,
+            temperature=self.settings.MODEL_TEMPERATURE or self.agent_config.temperature,
+            max_response_output_tokens=self.settings.MAX_RESPONSE_OUTPUT_TOKENS or self.agent_config.max_tokens
+        )
+        
+        await self.connection.session.update(session=session_config)
+        logger.info(f"⚙️ Sessão configurada: G.711 Mu-Law (Twilio Mode) | VAD(t={threshold})")
         """Configura parâmetros da sessão baseados no Env e Config"""
         
         # Definição de formatos de áudio
