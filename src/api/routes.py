@@ -1,6 +1,6 @@
 """
 API Routes - Twilio Integration com Transcoding (8kHz <-> 24kHz)
-Corrige: Erro 'not a whole number of frames' e chiado.
+Corrige: Invalid base64, Incorrect padding, e alinhamento de frames.
 """
 
 import asyncio
@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import audioop
+import binascii
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
 
@@ -39,7 +40,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
     worker_task = None
     stream_sid = None
     
-    # Estados para Transcoding (audioop mantém o contexto do filtro entre chunks)
+    # Estados para Transcoding
     state_in = None  
     state_out = None
 
@@ -54,26 +55,49 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
             return
 
         # 2. Callback de Saída (Azure 24k -> Twilio 8k)
-        async def send_audio_to_twilio(audio_data_24k: str):
+        async def send_audio_to_twilio(audio_data_24k):
             nonlocal state_out, stream_sid
             if not stream_sid: return
             
             try:
-                # O Azure envia Base64. Decodificamos para bytes PCM16 raw.
-                pcm_24k = base64.b64decode(audio_data_24k)
+                # --- SANITIZAÇÃO BLINDADA ---
                 
-                # --- CORREÇÃO DO ERRO "NOT A WHOLE NUMBER OF FRAMES" ---
-                # PCM16 usa 2 bytes por amostra. O tamanho total TEM que ser par.
-                # Se for ímpar, o audioop crasha. Cortamos o último byte.
+                # 1. Garante que é string limpa
+                if isinstance(audio_data_24k, bytes):
+                    audio_data_24k = audio_data_24k.decode('utf-8', errors='ignore')
+                audio_data_24k = audio_data_24k.strip()
+                
+                # 2. Descarta pacotes matematicamente inválidos para Base64 (resto 1)
+                # Isso evita o erro "number of data characters cannot be 1 more than a multiple of 4"
+                if len(audio_data_24k) % 4 == 1:
+                    # logger.warning("⚠️ Pacote Base64 inválido (truncado) ignorado.")
+                    return
+
+                # 3. Corrige Padding ausente
+                # O Azure às vezes manda sem padding. Python exige padding.
+                missing_padding = len(audio_data_24k) % 4
+                if missing_padding:
+                    audio_data_24k += '=' * (4 - missing_padding)
+
+                # 4. Decodificação Segura
+                try:
+                    pcm_24k = base64.b64decode(audio_data_24k)
+                except binascii.Error:
+                    # Se mesmo assim falhar, ignora o chunk
+                    return
+
+                # 5. Correção de Alinhamento PCM (Par)
+                # audioop exige número par de bytes
                 if len(pcm_24k) % 2 != 0:
                     pcm_24k = pcm_24k[:-1]
                 
-                # Se o chunk ficou vazio ou era muito pequeno, ignoramos
+                # Se o chunk ficou vazio, ignora
                 if not pcm_24k: 
                     return
 
-                # Downsample: 24000 -> 8000
-                # audioop.ratecv(fragment, width, nchannels, inrate, outrate, state)
+                # --- FIM SANITIZAÇÃO ---
+
+                # Transcoding: 24000 -> 8000
                 pcm_8k, state_out = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, state_out)
                 
                 # Converte PCM 8k (Linear) -> Mu-Law (Telefonia)
@@ -117,20 +141,24 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                     payload = data["media"]["payload"]
                     
                     if session_worker.connection:
-                        # Decodifica Twilio (Mu-Law 8k)
-                        ulaw_8k = base64.b64decode(payload)
-                        
-                        # Converte Mu-Law -> PCM 8k
-                        pcm_8k = audioop.ulaw2lin(ulaw_8k, 2)
-                        
-                        # Upsample: 8000 -> 24000
-                        pcm_24k, state_in = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, state_in)
-                        
-                        # Codifica para Base64 (Azure espera string base64)
-                        base64_24k = base64.b64encode(pcm_24k).decode('utf-8')
-                        
-                        # Envia para Azure
-                        await session_worker.ingest_audio(base64_24k)
+                        try:
+                            # Sanitização de Entrada
+                            # O Twilio geralmente é bem comportado, mas não custa prevenir
+                            missing_padding = len(payload) % 4
+                            if missing_padding:
+                                payload += '=' * (4 - missing_padding)
+
+                            ulaw_8k = base64.b64decode(payload)
+                            
+                            pcm_8k = audioop.ulaw2lin(ulaw_8k, 2)
+                            pcm_24k, state_in = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, state_in)
+                            
+                            base64_24k = base64.b64encode(pcm_24k).decode('utf-8')
+                            
+                            await session_worker.ingest_audio(base64_24k)
+                        except Exception:
+                            # Ignora pacotes de entrada ruins silenciosamente
+                            pass
 
                 elif event_type == "start":
                     stream_sid = data["start"]["streamSid"]
