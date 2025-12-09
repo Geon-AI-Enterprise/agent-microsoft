@@ -1,6 +1,6 @@
 """
 API Routes - Twilio Integration com Transcoding (8kHz <-> 24kHz)
-Corrige: Erro de Sample Rate e Falha de Interrupção
+Corrige: Erro 'not a whole number of frames' e chiado.
 """
 
 import asyncio
@@ -39,9 +39,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
     worker_task = None
     stream_sid = None
     
-    # Estados para Transcoding (audioop)
-    # state_in: mantem estado do filtro de upsampling
-    # state_out: mantem estado do filtro de downsampling
+    # Estados para Transcoding (audioop mantém o contexto do filtro entre chunks)
     state_in = None  
     state_out = None
 
@@ -56,19 +54,29 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
             return
 
         # 2. Callback de Saída (Azure 24k -> Twilio 8k)
-        async def send_audio_to_twilio(audio_data_24k: bytes):
+        async def send_audio_to_twilio(audio_data_24k: str):
             nonlocal state_out, stream_sid
             if not stream_sid: return
             
             try:
-                # Decodifica Base64 do Azure (PCM16 24kHz)
+                # O Azure envia Base64. Decodificamos para bytes PCM16 raw.
                 pcm_24k = base64.b64decode(audio_data_24k)
                 
+                # --- CORREÇÃO DO ERRO "NOT A WHOLE NUMBER OF FRAMES" ---
+                # PCM16 usa 2 bytes por amostra. O tamanho total TEM que ser par.
+                # Se for ímpar, o audioop crasha. Cortamos o último byte.
+                if len(pcm_24k) % 2 != 0:
+                    pcm_24k = pcm_24k[:-1]
+                
+                # Se o chunk ficou vazio ou era muito pequeno, ignoramos
+                if not pcm_24k: 
+                    return
+
                 # Downsample: 24000 -> 8000
                 # audioop.ratecv(fragment, width, nchannels, inrate, outrate, state)
                 pcm_8k, state_out = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, state_out)
                 
-                # Converte PCM 8k -> Mu-Law
+                # Converte PCM 8k (Linear) -> Mu-Law (Telefonia)
                 ulaw_8k = audioop.lin2ulaw(pcm_8k, 2)
                 
                 # Codifica para enviar ao Twilio
@@ -80,6 +88,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                     "media": {"payload": payload}
                 })
             except Exception as e:
+                # Loga o erro mas não derruba a chamada
                 logger.error(f"Erro transcoding OUT: {e}")
 
         async def send_clear_buffer():
@@ -108,7 +117,7 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                     payload = data["media"]["payload"]
                     
                     if session_worker.connection:
-                        # Decodifica Base64 Twilio (Mu-Law 8k)
+                        # Decodifica Twilio (Mu-Law 8k)
                         ulaw_8k = base64.b64decode(payload)
                         
                         # Converte Mu-Law -> PCM 8k
@@ -130,7 +139,8 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                     
             except WebSocketDisconnect:
                 break
-            except Exception:
+            except Exception as e:
+                logger.error(f"Erro no loop WebSocket: {e}")
                 break
 
     except Exception as e:
