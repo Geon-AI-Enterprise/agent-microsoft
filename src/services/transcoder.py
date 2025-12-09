@@ -1,7 +1,6 @@
 """
 Audio Transcoder Service - Com Jitter Buffer para Twilio
-Correção: Acumula bytes suficientes para formar pacotes de 20ms, 
-eliminando o som de "teclado/cliques" (packet starvation).
+Correção: Remove decodificação Base64 redundante na saída do Azure (SDK já entrega bytes).
 """
 
 import audioop
@@ -49,26 +48,31 @@ class AudioTranscoder:
             # state_in garante que a onda não "quebre" entre pacotes
             pcm_24k, self._state_in = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, self._state_in)
 
-            # Codifica para Base64
+            # Codifica para Base64 (Azure espera Base64 no buffer de input se for via JSON, 
+            # mas via SDK geralmente aceita bytes. Mantendo base64 por compatibilidade com ingest_audio)
             return base64.b64encode(pcm_24k).decode('utf-8')
 
         except Exception:
             return None
 
-    def azure_to_twilio(self, base64_payload: Union[str, bytes]) -> Optional[str]:
+    def azure_to_twilio(self, audio_data: Union[str, bytes]) -> Optional[str]:
         """
         Azure (PCM16 24k) -> Twilio (Mu-Law 8k)
         Implementa buffer para garantir pacotes de áudio coesos.
         """
         try:
-            # 1. Sanitiza e Decodifica
-            payload_bytes = self._sanitize_base64_input(base64_payload)
-            if not payload_bytes: return None
+            # CORREÇÃO PRINCIPAL AQUI:
+            # O SDK do Azure envia 'bytes' crus (PCM). Não devemos fazer b64decode neles.
+            if isinstance(audio_data, str):
+                # Se por acaso vier string, tentamos decodificar (fallback)
+                new_chunk = base64.b64decode(audio_data)
+            else:
+                # Se vier bytes, usamos diretamente
+                new_chunk = audio_data
 
-            new_chunk = base64.b64decode(payload_bytes)
+            if not new_chunk: return None
             
             # 2. ACUMULAÇÃO (A Mágica acontece aqui)
-            # Adiciona o novo pedaço ao acumulador
             self._azure_accumulator += new_chunk
 
             # Se não tivermos dados suficientes para um pacote de áudio estável (20ms),
@@ -77,8 +81,6 @@ class AudioTranscoder:
                 return None
 
             # 3. Processamento em Blocos
-            # Retiramos blocos múltiplos de 960 bytes para processar
-            # Isso garante que a conversão matemática seja sempre exata
             process_size = len(self._azure_accumulator) - (len(self._azure_accumulator) % self.MIN_CHUNK_SIZE)
             
             to_process = self._azure_accumulator[:process_size]
@@ -91,7 +93,7 @@ class AudioTranscoder:
             # 5. Converte Linear PCM16 -> Mu-Law 8-bit
             ulaw_8k = audioop.lin2ulaw(pcm_8k, 2)
 
-            # 6. Codifica Base64
+            # 6. Codifica Base64 (O Twilio EXIGE Base64 no JSON)
             return base64.b64encode(ulaw_8k).decode('utf-8')
 
         except Exception as e:
@@ -108,6 +110,7 @@ class AudioTranscoder:
             
             data = data.strip()
             
+            # Se for bytes puro que não parece base64, retorna ele mesmo (segurança)
             if len(data) % 4 == 1:
                 return None
                 
