@@ -1,11 +1,6 @@
 """
-Audio Transcoder Service
-
-Responsável por converter áudio entre os formatos:
-- Twilio: G.711 Mu-Law @ 8kHz
-- Azure: PCM16 Linear @ 24kHz
-
-Implementa sanitização de Base64 e manutenção de estado dos filtros de reamostragem.
+Audio Transcoder Service - Versão com Buffer de Alinhamento
+Corrige: Som de "teclado/cliques" causado por desalinhamento de bytes PCM.
 """
 
 import audioop
@@ -17,68 +12,73 @@ logger = logging.getLogger(__name__)
 
 class AudioTranscoder:
     def __init__(self):
-        # Mantém o estado dos filtros de conversão (ratecv) entre os chunks
-        # Isso evita "cliques" no áudio nas emendas dos pacotes
-        self._state_in = None   # Direção: Twilio -> Azure
-        self._state_out = None  # Direção: Azure -> Twilio
+        # Estados dos filtros de conversão
+        self._state_in = None
+        self._state_out = None
+        
+        # --- NOVO: Buffers de Alinhamento ---
+        # Guardam bytes "sozinhos" de um pacote para juntar com o próximo
+        self._in_buffer = b""   # Twilio -> Azure
+        self._out_buffer = b""  # Azure -> Twilio
 
     def twilio_to_azure(self, base64_payload: Union[str, bytes]) -> Optional[str]:
-        """
-        Converte áudio do Twilio (Mu-Law 8kHz) para Azure (PCM16 24kHz).
-        Retorna string Base64 pronta para o Azure.
-        """
+        """Twilio (Mu-Law 8k) -> Azure (PCM16 24k)"""
         try:
-            # 1. Sanitiza entrada (garante bytes válidos e padding)
             payload_bytes = self._sanitize_base64_input(base64_payload)
-            if not payload_bytes:
-                return None
+            if not payload_bytes: return None
 
-            # 2. Decodifica Base64 -> Raw Mu-Law
+            # Decodifica Base64 -> Mu-Law
             ulaw_8k = base64.b64decode(payload_bytes)
 
-            # 3. Converte Mu-Law -> PCM16 Linear
+            # Mu-Law é 1 byte por amostra, então não sofre de desalinhamento de frames.
+            # Mas convertemos para Linear (PCM16) para fazer o upsample.
             pcm_8k = audioop.ulaw2lin(ulaw_8k, 2)
 
-            # 4. Upsampling (8.000Hz -> 24.000Hz)
-            # ratecv(fragment, width, nchannels, inrate, outrate, state)
+            # Upsample: 8k -> 24k
             pcm_24k, self._state_in = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, self._state_in)
 
-            # 5. Codifica PCM16 -> String Base64 (Requisito do Azure)
+            # Codifica para Base64
             return base64.b64encode(pcm_24k).decode('utf-8')
 
         except Exception:
-            # Falhas silenciosas na entrada são preferíveis a desconectar
             return None
 
     def azure_to_twilio(self, base64_payload: Union[str, bytes]) -> Optional[str]:
-        """
-        Converte áudio do Azure (PCM16 24kHz) para Twilio (Mu-Law 8kHz).
-        Retorna string Base64 pronta para o Twilio.
-        """
+        """Azure (PCM16 24k) -> Twilio (Mu-Law 8k)"""
         try:
-            # 1. Sanitiza entrada (Corrige erro "ASCII only" e Padding)
+            # 1. Sanitiza
             payload_bytes = self._sanitize_base64_input(base64_payload)
-            if not payload_bytes:
-                return None
+            if not payload_bytes: return None
 
             # 2. Decodifica Base64 -> Raw PCM16 24k
-            pcm_24k = base64.b64decode(payload_bytes)
+            chunk = base64.b64decode(payload_bytes)
 
-            # 3. Correção de Alinhamento (Evita erro "not a whole number of frames")
-            # PCM16 usa 2 bytes por amostra. Tamanho ímpar quebra o audioop.
-            if len(pcm_24k) % 2 != 0:
-                pcm_24k = pcm_24k[:-1]
+            # 3. --- LÓGICA DE ALINHAMENTO DE BYTES (CORREÇÃO DO CHIADO) ---
+            # Recupera o que sobrou do último pacote e junta com o atual
+            chunk = self._out_buffer + chunk
             
-            if not pcm_24k:
+            # PCM16 exige pares de bytes. Se o total for ímpar, sobra 1 byte.
+            if len(chunk) % 2 != 0:
+                # Guarda o último byte para o próximo round
+                self._out_buffer = chunk[-1:]
+                chunk = chunk[:-1] # Processa apenas os pares
+            else:
+                # Tudo alinhado, limpa o buffer
+                self._out_buffer = b""
+
+            # Se depois de alinhar não sobrou nada para processar, retorna
+            if not chunk:
                 return None
+            # -----------------------------------------------------------
 
-            # 4. Downsampling (24.000Hz -> 8.000Hz)
-            pcm_8k, self._state_out = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, self._state_out)
+            # 4. Downsample: 24k -> 8k
+            # state mantém a continuidade da onda sonora
+            pcm_8k, self._state_out = audioop.ratecv(chunk, 2, 1, 24000, 8000, self._state_out)
 
-            # 5. Converte PCM16 Linear -> Mu-Law
+            # 5. Converte Linear -> Mu-Law
             ulaw_8k = audioop.lin2ulaw(pcm_8k, 2)
 
-            # 6. Codifica Mu-Law -> String Base64 (Requisito do Twilio)
+            # 6. Codifica Base64
             return base64.b64encode(ulaw_8k).decode('utf-8')
 
         except Exception as e:
@@ -86,24 +86,17 @@ class AudioTranscoder:
             return None
 
     def _sanitize_base64_input(self, data: Union[str, bytes]) -> Optional[bytes]:
-        """
-        Limpa a string Base64 para evitar erros comuns de decodificação.
-        - Remove caracteres não-ASCII
-        - Corrige Padding (=)
-        - Valida tamanho matemático
-        """
+        """Limpa string Base64"""
         try:
-            # Se for string, força conversão para bytes ASCII, ignorando lixo UTF-8
             if isinstance(data, str):
                 data = data.encode('ascii', 'ignore')
             
             data = data.strip()
             
-            # Validação rápida de integridade Base64 (tamanho % 4 != 1)
+            # Validação matemática Base64
             if len(data) % 4 == 1:
                 return None
                 
-            # Adiciona Padding faltante se necessário
             missing_padding = len(data) % 4
             if missing_padding:
                 data += b'=' * (4 - missing_padding)
