@@ -23,8 +23,10 @@ settings = get_settings()
 
 app = FastAPI(title="Voice Agent API")
 
-client_manager = ClientManager(settings.DB_URL)
-
+client_manager = ClientManager(
+    supabase_url=settings.SUPABASE_URL,
+    supabase_key=settings.SUPABASE_SERVICE_ROLE_KEY,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

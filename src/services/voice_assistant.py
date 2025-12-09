@@ -66,7 +66,7 @@ class VoiceAssistantWorker:
         self._greeting_sent_at = 0
         
         # Configurações de latência e proteção
-        self._greeting_delay = self.settings.GREETING_DELAY or 1.0
+        self._greeting_delay = self.settings.GREETING_DELAY_SECONDS or 1.0
         
         logger.info(f"🚀 Worker inicializado | Voz: {self.agent_config.voice}")
 
