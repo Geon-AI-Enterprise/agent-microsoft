@@ -35,6 +35,7 @@ from src.core.config import get_settings
 from src.services.transcoder import AudioTranscoder
 from src.services.voice_assistant import VoiceAssistantWorker
 from src.services.client_manager import ClientManager
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
