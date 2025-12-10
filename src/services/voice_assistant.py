@@ -226,7 +226,8 @@ class VoiceAssistantWorker:
             if event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
                 # event.output_audio_delta é base64 PCM16 24kHz
                 try:
-                    chunk = base64.b64decode(event.delta)
+                    b64_data = getattr(event, "delta", None) or getattr(event, "output_audio_delta", "")
+                    chunk = base64.b64decode(b64_data)
                     await self._agent_audio_queue.put(chunk)
                 except Exception as e:
                     logger.error(f"❌ Erro ao decodificar áudio do agente: {e}")
@@ -235,14 +236,15 @@ class VoiceAssistantWorker:
             # Transcrições / logs (opcional, para debug)
             # ------------------------------------------------------------------
             elif event.type == ServerEventType.TRANSCRIPT:
-                text = getattr(event, "text", "")
+                text = getattr(event, "transcript", None) or getattr(event, "delta", "")
                 logger.info(f"📝 Transcript: {text}")
 
             # ------------------------------------------------------------------
             # Eventos de erro
             # ------------------------------------------------------------------
             elif event.type == ServerEventType.ERROR:
-                logger.error(f"❌ Erro do Azure: {event.error}")
+                error_msg = getattr(event, "error", None) or getattr(event, "message", str(event))
+                logger.error(f"❌ Erro do Azure: {error_msg}")
 
     # ==========================================================================
     # API PÚBLICA: ENTRADA DE ÁUDIO (Twilio → Azure)
