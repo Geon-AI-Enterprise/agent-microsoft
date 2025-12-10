@@ -223,10 +223,10 @@ class VoiceAssistantWorker:
             # ------------------------------------------------------------------
             # Áudio de saída do agente (Azure → Twilio)
             # ------------------------------------------------------------------
-            if event.type == ServerEventType.RESPONSE_OUTPUT_AUDIO_DELTA:
+            if event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
                 # event.output_audio_delta é base64 PCM16 24kHz
                 try:
-                    chunk = base64.b64decode(event.output_audio_delta)
+                    chunk = base64.b64decode(event.delta)
                     await self._agent_audio_queue.put(chunk)
                 except Exception as e:
                     logger.error(f"❌ Erro ao decodificar áudio do agente: {e}")
