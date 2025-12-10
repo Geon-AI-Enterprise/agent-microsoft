@@ -27,6 +27,7 @@ from azure.core.credentials import AzureKeyCredential
 from azure.identity.aio import DefaultAzureCredential
 from azure.ai.voicelive.aio import connect, VoiceLiveConnection
 from azure.ai.voicelive.aio import ConnectionError as VoiceLiveConnectionError
+from azure.ai.voicelive.models import ServerEventType
 from azure.ai.voicelive.models import (
     AzureStandardVoice,
     InputAudioFormat,
@@ -228,9 +229,12 @@ class VoiceAssistantWorker:
             # ------------------------------------------------------------------
             # Transcrições / logs (opcional, para debug)
             # ------------------------------------------------------------------
-            elif event.type == ServerEventType.TRANSCRIPT:
-                text = getattr(event, "transcript", None) or getattr(event, "delta", "")
-                logger.info(f"📝 Transcript: {text}")
+            elif event.type in (
+                ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DELTA,
+                ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE,
+            ):
+                text = getattr(event, "delta", None) or getattr(event, "transcript", "")
+                logger.info(f"📝 Agent transcript ({event.type}): {text}")
 
             # ------------------------------------------------------------------
             # Eventos de erro
