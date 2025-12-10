@@ -134,7 +134,44 @@ class VoiceAssistantWorker:
     # ==========================================================================
     # CONFIGURAÇÃO DE SESSÃO COM SERVER VAD
     # ==========================================================================
-    async def _configure_session(self):
+    async def _configure_session(self) -> None:
+        logger.info("⚙️ Configurando sessão com Server VAD...")
+
+        if not self.connection:
+            raise RuntimeError("Conexão com Azure VoiceLive ainda não está disponível")
+
+        # Escolhe o tipo de voz:
+        # - Se for nome de voz Azure (ex: 'pt-BR-LuizaNeural') usamos AzureStandardVoice
+        # - Se for voz OpenAI (ex: 'alloy') passamos a string direto
+        voice_name = self.agent_config.voice
+
+        if "-" in voice_name:
+            # Formato típico de voz Azure
+            voice_config = AzureStandardVoice(name=voice_name)
+        else:
+            # Voz OpenAI (string simples)
+            voice_config = voice_name
+
+        # Server VAD - parâmetros sugeridos na doc:
+        vad = ServerVad(
+            threshold=0.5,
+            prefix_padding_ms=300,
+            silence_duration_ms=500,
+        )
+
+        session = RequestSession(
+            modalities=[Modality.TEXT, Modality.AUDIO],
+            voice=voice_config,
+            input_audio_format=InputAudioFormat.PCM16,
+            output_audio_format=OutputAudioFormat.PCM16,
+            turn_detection=vad,
+        )
+
+        # API nova: update(), não configure()
+        await self.connection.session.update(session=session)
+
+        logger.info("✅ Sessão configurada com Server VAD habilitado")
+
         """
         Configura a sessão no Azure VoiceLive com Server VAD habilitado.
         Toda a lógica de VAD/barge-in fica no servidor.
@@ -302,16 +339,23 @@ class VoiceAssistantWorker:
     async def send_user_audio(self, pcm_bytes: bytes) -> None:
         """
         Envia áudio do usuário para o Azure.
-        
-        Chamado pelo WebSocket handler quando recebe áudio do Twilio.
-        
-        NOTA: Com Server VAD habilitado, NÃO fazemos commit() manual.
-        O Azure detecta automaticamente quando o usuário para de falar
-        e faz o commit internamente.
-        
-        Args:
-            pcm_bytes: Bytes PCM16 24 kHz já convertidos pelo transcoder
+
+        Espera receber PCM16 24 kHz (já convertido pelo transcoder) e
+        envia em base64 via InputAudioBufferResource.append, que aceita
+        apenas parâmetros nomeados.
         """
+        if not self.connection:
+            return
+
+        try:
+            # 1) PCM16 → base64 (formato esperado pela API)
+            audio_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
+
+            # 2) append keyword-only
+            await self.connection.input_audio_buffer.append(audio=audio_b64)
+        except Exception as e:
+            logger.error(f"❌ Erro ao enviar áudio para Azure: {e}", exc_info=True)
+
         if not self.connection:
             return
 
