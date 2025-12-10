@@ -1,143 +1,241 @@
 """
-Audio Transcoder Service - Com Jitter Buffer para Twilio
-Correção: Remove decodificação Base64 redundante na saída do Azure (SDK já entrega bytes).
+Audio Transcoder Service - Conversão de Formato Twilio ↔ Azure
+
+=============================================================================
+ARQUITETURA: TWILIO COMO "PIPE BURRO"
+=============================================================================
+
+Este módulo é responsável APENAS por conversão de formato de áudio:
+- Twilio → Azure: 8 kHz μ-law (base64) → 24 kHz PCM16 (bytes)
+- Azure → Twilio: 24 kHz PCM16 (bytes) → 8 kHz μ-law (base64)
+
+IMPORTANTE: Este módulo NÃO realiza:
+- VAD (detecção de voz) → Responsabilidade do Azure (Server VAD)
+- Barge-in → Responsabilidade do Azure
+- Controle de turnos → Responsabilidade do Azure
+- Análise de energia/silêncio → Responsabilidade do Azure
+
+O backend atua apenas como proxy de áudio, convertendo formatos entre Twilio e Azure.
+=============================================================================
 """
 
 import audioop
 import base64
 import logging
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 logger = logging.getLogger(__name__)
 
+
 class AudioTranscoder:
+    """
+    Conversor de áudio entre formatos Twilio e Azure.
+    
+    Fluxo:
+    - Twilio (8 kHz μ-law, base64) ←→ Azure (24 kHz PCM16, bytes)
+    
+    Mantém um pequeno jitter buffer (2-4 frames) para garantir
+    pacotes de áudio coesos e evitar áudio picotado.
+    """
+
+    # Tamanho mínimo de chunk para a Twilio (20ms de áudio μ-law @ 8kHz = 160 bytes)
+    MIN_TWILIO_CHUNK_SIZE = 160
+    
+    # Tamanho mínimo de PCM 24kHz para gerar um frame de 20ms @ 8kHz
+    # 20ms @ 24kHz = 480 samples * 2 bytes (16-bit) = 960 bytes
+    MIN_PCM_24K_FRAME_SIZE = 960
+
     def __init__(self):
-        # Estados dos filtros de conversão (audioop mantém o contexto da onda)
-        self._state_in = None
-        self._state_out = None
+        """Inicializa o transcoder com buffers vazios."""
+        # Estados dos filtros de conversão (audioop mantém contexto da onda para resample suave)
+        self._state_in = None   # Estado para conversão Twilio → Azure
+        self._state_out = None  # Estado para conversão Azure → Twilio
         
-        # Buffer interno para garantir tamanhos de frame consistentes (20ms @ 8kHz = 160 bytes)
-        self._twilio_buffer = b""
-        self._azure_accumulator = b""
+        # Buffers internos para garantir tamanhos de frame consistentes
+        self._twilio_buffer = b""       # Buffer de saída para Twilio (μ-law)
+        self._azure_accumulator = b""   # Acumulador de entrada do Azure (PCM 24k)
 
-        # Tamanho mínimo de chunk para a Twilio (20ms de áudio Mu-Law @ 8kHz)
-        self.MIN_CHUNK_SIZE = 160  
+        logger.debug("🔄 AudioTranscoder inicializado")
 
-    # ------------------------------------------------------------------
-    # TWILIO (Mu-Law 8kHz) -> AZURE (PCM16 24kHz)
-    # ------------------------------------------------------------------
+    # ==========================================================================
+    # TWILIO → AZURE (Entrada de áudio do usuário)
+    # ==========================================================================
     def twilio_to_azure(self, base64_audio: str) -> Optional[bytes]:
         """
-        Twilio (Mu-Law 8kHz) -> Azure (PCM16 24kHz)
-        - Decodifica Base64
-        - Converte de Mu-Law para PCM16
-        - Faz resample de 8kHz -> 24kHz
+        Converte áudio do Twilio para formato Azure.
+        
+        Direção: Twilio (usuário) → Azure (modelo)
+        
+        Conversão:
+        1. Base64 decode → bytes μ-law 8 kHz
+        2. μ-law → PCM16 linear
+        3. Resample 8 kHz → 24 kHz
+        
+        Args:
+            base64_audio: Payload base64 do evento 'media' do Twilio
+            
+        Returns:
+            Bytes PCM16 24 kHz prontos para enviar ao Azure, ou None se erro
         """
         try:
             if not base64_audio:
                 return None
 
+            # 1. Decodifica base64 → bytes μ-law 8 kHz
             mulaw_8k = base64.b64decode(base64_audio)
 
-            # Converte de Mu-Law para PCM16 8kHz
-            pcm_8k, self._state_in = audioop.ulaw2lin(mulaw_8k, 2), self._state_in
+            # 2. Converte μ-law → PCM16 linear (8 kHz)
+            pcm_8k = audioop.ulaw2lin(mulaw_8k, 2)  # 2 = 16 bits
 
-            # Resample 8kHz -> 24kHz (fator 3x)
-            pcm_24k, self._state_out = audioop.ratecv(
-                pcm_8k, 
-                2,  # 16 bits
-                1,  # mono
-                8000, 
-                24000,
-                self._state_out
+            # 3. Resample 8 kHz → 24 kHz (fator 3x)
+            pcm_24k, self._state_in = audioop.ratecv(
+                pcm_8k,
+                2,      # 16 bits por sample
+                1,      # mono
+                8000,   # sample rate origem
+                24000,  # sample rate destino
+                self._state_in
             )
 
             return pcm_24k
 
         except Exception as e:
-            logger.error(f"Erro ao converter áudio Twilio -> Azure: {e}")
+            logger.error(f"❌ Erro ao converter áudio Twilio → Azure: {e}")
             return None
 
-    # ------------------------------------------------------------------
-    # AZURE (PCM16 24kHz) -> TWILIO (Mu-Law 8kHz) + Jitter Buffer
-    # ------------------------------------------------------------------
+    # ==========================================================================
+    # AZURE → TWILIO (Saída de áudio do agente)
+    # ==========================================================================
     def azure_to_twilio(self, audio_data: Union[str, bytes]) -> Optional[str]:
         """
-        Azure (PCM16 24k) -> Twilio (Mu-Law 8k)
-        Implementa buffer para garantir pacotes de áudio coesos.
+        Converte áudio do Azure para formato Twilio.
+        
+        Direção: Azure (modelo) → Twilio (usuário)
+        
+        Conversão:
+        1. PCM16 24 kHz → Resample para 8 kHz
+        2. PCM16 → μ-law
+        3. Encode base64
+        
+        Implementa jitter buffer pequeno (~2-4 frames de 20ms) para
+        garantir pacotes coesos e evitar áudio picotado.
+        
+        Args:
+            audio_data: Bytes PCM16 24 kHz do Azure (ou string base64 para compatibilidade)
+            
+        Returns:
+            String base64 com áudio μ-law 8 kHz pronto para enviar ao Twilio, ou None
         """
         try:
-            # CORREÇÃO PRINCIPAL AQUI:
-            # - Se o SDK do Azure já nos entrega bytes (PCM16 24k), não devemos 
-            #   decodificar Base64 novamente. Apenas quando recebermos string.
+            # Compatibilidade: se receber string (base64), decodifica primeiro
+            # Fluxo normal: SDK Azure já entrega bytes PCM16 diretamente
             if isinstance(audio_data, str):
-                # Mantido por compatibilidade, caso algum fluxo ainda envie Base64
                 pcm_24k = base64.b64decode(audio_data)
             else:
-                # Fluxo normal: já é bytes PCM16 24k
                 pcm_24k = audio_data
 
             # Acumula no buffer interno
             self._azure_accumulator += pcm_24k
 
             # Lista de chunks prontos para envio
-            chunks = []
+            chunks: List[str] = []
 
-            # Precisamos de pelo menos 20ms de áudio em 8kHz para enviar ao Twilio
-            # 20ms @ 8kHz = 160 samples mono = 160 bytes em Mu-Law
-            # Em 24kHz PCM16, isso equivale a 480 samples * 2 bytes = 960 bytes
-            MIN_PCM_24K_BYTES = 960
+            # Processa enquanto houver frames completos de 20ms
+            while len(self._azure_accumulator) >= self.MIN_PCM_24K_FRAME_SIZE:
+                # Extrai um frame de 20ms (960 bytes @ 24 kHz PCM16)
+                frame_24k = self._azure_accumulator[:self.MIN_PCM_24K_FRAME_SIZE]
+                self._azure_accumulator = self._azure_accumulator[self.MIN_PCM_24K_FRAME_SIZE:]
 
-            while len(self._azure_accumulator) >= MIN_PCM_24K_BYTES:
-                # Separa um frame de 20ms em 24kHz
-                frame_24k = self._azure_accumulator[:MIN_PCM_24K_BYTES]
-                self._azure_accumulator = self._azure_accumulator[MIN_PCM_24K_BYTES:]
-
-                # Converte 24kHz -> 8kHz
+                # Resample 24 kHz → 8 kHz
                 pcm_8k, self._state_out = audioop.ratecv(
                     frame_24k,
-                    2,  # 16 bits
-                    1,  # mono
-                    24000,
-                    8000,
+                    2,      # 16 bits
+                    1,      # mono
+                    24000,  # origem
+                    8000,   # destino
                     self._state_out
                 )
 
-                # Converte PCM16 -> Mu-Law
+                # Converte PCM16 → μ-law
                 mulaw_8k = audioop.lin2ulaw(pcm_8k, 2)
 
                 # Acumula no buffer de saída para garantir tamanho mínimo
                 self._twilio_buffer += mulaw_8k
 
-                # Enquanto houver pelo menos 20ms de áudio, cortamos e empacotamos
-                while len(self._twilio_buffer) >= self.MIN_CHUNK_SIZE:
-                    chunk = self._twilio_buffer[:self.MIN_CHUNK_SIZE]
-                    self._twilio_buffer = self._twilio_buffer[self.MIN_CHUNK_SIZE:]
-
-                    # Codifica em Base64 para envio ao Twilio
+                # Empacota em chunks de 20ms (160 bytes μ-law)
+                while len(self._twilio_buffer) >= self.MIN_TWILIO_CHUNK_SIZE:
+                    chunk = self._twilio_buffer[:self.MIN_TWILIO_CHUNK_SIZE]
+                    self._twilio_buffer = self._twilio_buffer[self.MIN_TWILIO_CHUNK_SIZE:]
+                    
+                    # Codifica em base64 para envio ao Twilio
                     chunks.append(base64.b64encode(chunk).decode("utf-8"))
 
-            # Se nenhum chunk completo foi gerado, não envia nada
+            # Retorna o último chunk gerado (mais recente)
+            # Nota: Em um sistema real, você pode querer retornar todos os chunks
             if not chunks:
                 return None
 
-            # Retornamos o maior chunk gerado (ou você pode escolher concatenar, 
-            # dependendo da granularidade desejada).
             return chunks[-1]
 
         except Exception as e:
-            logger.error(f"Erro ao converter áudio Azure -> Twilio: {e}")
+            logger.error(f"❌ Erro ao converter áudio Azure → Twilio: {e}")
             return None
 
-    # ------------------------------------------------------------------
-    # Funções de limpeza (para barge-in / interrupções)
-    # ------------------------------------------------------------------
+    def azure_to_twilio_all(self, audio_data: Union[str, bytes]) -> List[str]:
+        """
+        Versão que retorna TODOS os chunks gerados (para streaming mais granular).
+        
+        Útil quando você quer enviar cada chunk individualmente para menor latência.
+        
+        Args:
+            audio_data: Bytes PCM16 24 kHz do Azure
+            
+        Returns:
+            Lista de strings base64, cada uma com 20ms de áudio μ-law 8 kHz
+        """
+        try:
+            if isinstance(audio_data, str):
+                pcm_24k = base64.b64decode(audio_data)
+            else:
+                pcm_24k = audio_data
+
+            self._azure_accumulator += pcm_24k
+            chunks: List[str] = []
+
+            while len(self._azure_accumulator) >= self.MIN_PCM_24K_FRAME_SIZE:
+                frame_24k = self._azure_accumulator[:self.MIN_PCM_24K_FRAME_SIZE]
+                self._azure_accumulator = self._azure_accumulator[self.MIN_PCM_24K_FRAME_SIZE:]
+
+                pcm_8k, self._state_out = audioop.ratecv(
+                    frame_24k, 2, 1, 24000, 8000, self._state_out
+                )
+
+                mulaw_8k = audioop.lin2ulaw(pcm_8k, 2)
+                self._twilio_buffer += mulaw_8k
+
+                while len(self._twilio_buffer) >= self.MIN_TWILIO_CHUNK_SIZE:
+                    chunk = self._twilio_buffer[:self.MIN_TWILIO_CHUNK_SIZE]
+                    self._twilio_buffer = self._twilio_buffer[self.MIN_TWILIO_CHUNK_SIZE:]
+                    chunks.append(base64.b64encode(chunk).decode("utf-8"))
+
+            return chunks
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao converter áudio Azure → Twilio (all): {e}")
+            return []
+
+    # ==========================================================================
+    # LIMPEZA DE BUFFERS
+    # ==========================================================================
     def clear(self):
         """
-        Limpa todos os buffers e estados internos (usado em interrupções).
+        Limpa todos os buffers e estados internos.
+        
+        Chamado quando a Azure sinaliza interrupção/barge-in para garantir
+        que nenhum áudio residual da resposta anterior seja enviado.
         """
         self._state_in = None
         self._state_out = None
         self._twilio_buffer = b""
         self._azure_accumulator = b""
-        logger.debug("🔁 AudioTranscoder: estados e buffers resetados")
+        logger.debug("🔁 AudioTranscoder: buffers e estados resetados")

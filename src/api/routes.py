@@ -1,10 +1,27 @@
 """
-API Routes - Twilio Integration (Clean Architecture)
+API Routes - Twilio ↔ Azure Audio Proxy
 
-Responsabilidade:
-- Gerenciar ciclo de vida do WebSocket (Conectar/Desconectar)
-- Orquestrar fluxo de dados: Twilio <-> Transcoder <-> Azure Worker
-- NÃO realiza processamento de áudio (delegado ao Transcoder)
+=============================================================================
+ARQUITETURA: TWILIO COMO "PIPE BURRO"
+=============================================================================
+
+Este módulo implementa um WebSocket proxy SIMPLES entre Twilio e Azure:
+- Twilio envia áudio 8 kHz μ-law (base64) → convertemos para PCM 24k → Azure
+- Azure envia áudio PCM 24k → convertemos para 8 kHz μ-law (base64) → Twilio
+
+IMPORTANTE: Este módulo NÃO realiza:
+- VAD (detecção de voz) → Responsabilidade do Azure (Server VAD)
+- Barge-in → Responsabilidade do Azure
+- Controle de turnos → Responsabilidade do Azure
+- Análise de energia/silêncio → Responsabilidade do Azure
+
+O endpoint WebSocket /ws/audio/{sip_number} apenas:
+1. Identifica o cliente via ClientManager (multi-tenant)
+2. Conecta ao Azure VoiceLive
+3. Roda duas coroutines em paralelo:
+   - twilio_to_azure: recebe áudio do Twilio e envia para Azure
+   - azure_to_twilio: recebe áudio do Azure e envia para Twilio
+=============================================================================
 """
 
 import asyncio
@@ -33,9 +50,7 @@ client_manager = ClientManager(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Controla inicialização e finalização de recursos da aplicação.
-    """
+    """Controla inicialização e finalização de recursos da aplicação."""
     logger.info("🚀 Voice Agent API iniciando...")
     yield
     logger.info("🧹 Voice Agent API finalizando...")
@@ -47,8 +62,20 @@ app.router.lifespan_context = lifespan
 @app.websocket("/ws/audio/{sip_number}")
 async def audio_stream(websocket: WebSocket, sip_number: str):
     """
-    Controlador principal da sessão de voz.
-    Conecta o telefone (Twilio) à inteligência (Azure) usando o Transcoder como ponte.
+    WebSocket endpoint que atua como proxy de áudio entre Twilio e Azure.
+    
+    Fluxo:
+    1. Aceita conexão WebSocket da Twilio
+    2. Identifica cliente via sip_number (Supabase/ClientManager)
+    3. Inicia worker do Azure VoiceLive
+    4. Executa duas coroutines em paralelo:
+       - twilio_to_azure(): Twilio → Transcoder → Azure
+       - azure_to_twilio(): Azure → Transcoder → Twilio
+    5. Encerra tudo quando qualquer lado desconecta
+    
+    Args:
+        websocket: Conexão WebSocket da Twilio
+        sip_number: Número SIP para identificar o cliente
     """
     await websocket.accept()
     logger.info(f"📞 Conexão Twilio recebida: {sip_number}")
@@ -57,119 +84,155 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
     worker_task: asyncio.Task | None = None
     stream_sid: str | None = None
 
-    # Instancia o especialista em áudio (Isolamento de Responsabilidade)
+    # Instancia o transcoder (conversão de formato apenas)
     transcoder = AudioTranscoder()
 
     try:
-        # 1. Identificação do Cliente (Banco de Dados / Supabase)
+        # ======================================================================
+        # 1. IDENTIFICAÇÃO DO CLIENTE (Multi-tenant via Supabase)
+        # ======================================================================
         client_config = client_manager.get_client_config(sip_number)
         if not client_config:
-            logger.error(f"❌ Cliente não encontrado para o número: {sip_number}")
-            await websocket.close()
+            logger.error(f"❌ Cliente não encontrado: {sip_number}")
+            await websocket.close(code=4004, reason="Client not found")
             return
 
-        logger.info(f"👤 Cliente identificado: {client_config.name}")
+        logger.info(f"👤 Cliente identificado: {getattr(client_config, 'name', sip_number)}")
 
-        # 2. Configuração do Handler de Saída (Azure -> Twilio)
-        async def handle_azure_audio(pcm_24k: bytes):
-            """
-            Recebe áudio 24k PCM16 do Azure e envia para o Twilio em Mu-Law 8k.
-            """
-            try:
-                base64_chunk = transcoder.azure_to_twilio(pcm_24k)
-                if not base64_chunk:
-                    return
-
-                if not stream_sid:
-                    return
-
-                payload = {
-                    "event": "media",
-                    "streamSid": stream_sid,
-                    "media": {
-                        "payload": base64_chunk,
-                    },
-                }
-                await websocket.send_text(json.dumps(payload))
-            except Exception as e:
-                logger.error(f"Erro ao enviar áudio para Twilio: {e}")
-
-        async def handle_interruption():
-            """
-            Limpa os buffers internos do Transcoder, garantindo que nenhum áudio residual
-            seja enviado após um barge-in.
-            """
-            try:
-                transcoder.clear()
-                await websocket.send_text(json.dumps({"event": "clear"}))
-                logger.info("⚡ Buffer de áudio limpo (Barge-in)")
-            except Exception as e:
-                logger.error(f"❌ Falha ao limpar buffer de áudio: {e}")
-
-        # 3. Inicializa o Worker do Azure (Inteligência)
+        # ======================================================================
+        # 2. INICIALIZA WORKER DO AZURE (Sem callbacks - usa streaming)
+        # ======================================================================
         session_worker = VoiceAssistantWorker(
             agent_config=client_config,
             settings=settings,
-            audio_output_handler=handle_azure_audio,
-            interruption_handler=handle_interruption,
         )
 
-        # Inicia conexão em background
+        # Inicia conexão com Azure em background
         worker_task = asyncio.create_task(session_worker.connect_and_run())
 
-        # 4. Loop principal do WebSocket com Twilio
-        while True:
+        # Aguarda conexão estar pronta (pequeno delay para setup)
+        await asyncio.sleep(0.1)
+
+        # ======================================================================
+        # 3. DEFINE COROUTINES DE STREAMING BIDIRECIONAL
+        # ======================================================================
+        
+        async def twilio_to_azure():
+            """
+            Recebe áudio do Twilio e envia para o Azure.
+            
+            Loop infinito que:
+            1. Lê mensagens JSON do WebSocket Twilio
+            2. Filtra apenas eventos 'media'
+            3. Converte áudio 8kHz μ-law → 24kHz PCM
+            4. Envia para o Azure via worker.send_user_audio()
+            """
+            nonlocal stream_sid
+            
             try:
-                message = await websocket.receive_text()
-                data = json.loads(message)
-                event_type = data.get("event")
+                while True:
+                    message = await websocket.receive_text()
+                    data = json.loads(message)
+                    event_type = data.get("event")
 
-                if event_type == "start":
-                    stream_sid = data["start"]["streamSid"]
-                    logger.info(f"▶️ Stream iniciado: {stream_sid}")
+                    if event_type == "start":
+                        # Twilio inicia o stream - captura o streamSid
+                        stream_sid = data["start"]["streamSid"]
+                        logger.info(f"▶️ Stream Twilio iniciado: {stream_sid}")
 
-                elif event_type == "media":
-                    # Extrai payload bruto (Mu-Law 8k)
-                    raw_payload = data["media"]["payload"]
+                    elif event_type == "media":
+                        # Áudio do usuário chegou
+                        if session_worker and session_worker.connection:
+                            # Extrai payload base64 (8kHz μ-law)
+                            raw_payload = data["media"]["payload"]
+                            
+                            # Converte para PCM 24kHz
+                            pcm_24k = transcoder.twilio_to_azure(raw_payload)
+                            
+                            if pcm_24k:
+                                # Envia para Azure (sem barge-in manual!)
+                                await session_worker.send_user_audio(pcm_24k)
 
-                    # 🔥 BARGE-IN ANTECIPADO:
-                    # Sempre que chega mídia nova do usuário, tentamos barge-in.
-                    # O worker decide se realmente há algo para interromper.
-                    if session_worker:
-                        try:
-                            await session_worker.trigger_barge_in()
-                        except Exception as e:
-                            logger.warning(f"⚠️ Falha ao acionar barge-in pelo lado Twilio: {e}")
-
-                    # Delega conversão/limpeza para o Transcoder
-                    clean_24k_payload = transcoder.twilio_to_azure(raw_payload)
-
-                    # Se o áudio for válido, envia para o Azure
-                    if clean_24k_payload and session_worker and session_worker.connection:
-                        await session_worker.ingest_audio(clean_24k_payload)
-
-                elif event_type == "stop":
-                    logger.info("⏹️ Stream finalizado pelo Twilio")
-                    break
+                    elif event_type == "stop":
+                        # Twilio encerrou o stream
+                        logger.info("⏹️ Stream finalizado pelo Twilio")
+                        break
 
             except WebSocketDisconnect:
-                logger.info(f"🔌 Conexão encerrada para o número: {sip_number}")
-                break
+                logger.info(f"🔌 Twilio desconectou: {sip_number}")
             except Exception as e:
-                # Erros de JSON ou protocolo não devem derrubar o servidor
-                logger.error(f"Erro no loop de eventos: {e}")
-                break
+                logger.error(f"❌ Erro no loop Twilio → Azure: {e}")
+
+        async def azure_to_twilio():
+            """
+            Recebe áudio do Azure e envia para o Twilio.
+            
+            Loop assíncrono que:
+            1. Itera sobre chunks de áudio via worker.iter_agent_audio()
+            2. Converte PCM 24kHz → 8kHz μ-law base64
+            3. Envia para Twilio como evento 'media'
+            """
+            try:
+                # Aguarda worker estar pronto
+                while not session_worker or not session_worker.connection:
+                    await asyncio.sleep(0.05)
+                    if worker_task and worker_task.done():
+                        return
+
+                # Itera sobre chunks de áudio do agente
+                async for pcm_bytes in session_worker.iter_agent_audio():
+                    if not stream_sid:
+                        continue
+
+                    # Converte PCM 24k → μ-law 8k base64
+                    # Usa azure_to_twilio_all para pegar todos os chunks gerados
+                    base64_chunks = transcoder.azure_to_twilio_all(pcm_bytes)
+                    
+                    for base64_chunk in base64_chunks:
+                        if base64_chunk:
+                            # Monta payload no formato Twilio
+                            payload = {
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {
+                                    "payload": base64_chunk,
+                                },
+                            }
+                            await websocket.send_text(json.dumps(payload))
+
+            except WebSocketDisconnect:
+                logger.info(f"🔌 Twilio desconectou durante envio: {sip_number}")
+            except Exception as e:
+                logger.error(f"❌ Erro no loop Azure → Twilio: {e}")
+
+        # ======================================================================
+        # 4. EXECUTA AMBAS AS DIREÇÕES EM PARALELO
+        # ======================================================================
+        await asyncio.gather(
+            twilio_to_azure(),
+            azure_to_twilio(),
+            return_exceptions=True
+        )
 
     except Exception as e:
         logger.critical(f"❌ Erro crítico na sessão: {e}", exc_info=True)
 
     finally:
-        # Limpeza robusta de recursos
+        # ======================================================================
+        # 5. LIMPEZA DE RECURSOS
+        # ======================================================================
+        logger.info(f"🧹 Encerrando sessão: {sip_number}")
+        
         if session_worker:
             session_worker.shutdown()
+        
         if worker_task:
             worker_task.cancel()
             try:
                 await worker_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
+
+        logger.info(f"👋 Sessão encerrada: {sip_number}")
