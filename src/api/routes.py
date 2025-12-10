@@ -47,6 +47,14 @@ client_manager = ClientManager(
     supabase_key=settings.SUPABASE_SERVICE_ROLE_KEY,
 )
 
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "env": settings.APP_ENV,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
