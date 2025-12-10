@@ -140,6 +140,9 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
             
             try:
                 while True:
+                    if worker_task and worker_task.done():
+                        logger.info("⛔ Worker Azure finalizado, parando Twilio → Azure")
+                        return
                     message = await websocket.receive_text()
                     data = json.loads(message)
                     event_type = data.get("event")

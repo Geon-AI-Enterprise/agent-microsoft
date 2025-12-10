@@ -26,6 +26,7 @@ from typing import Optional, AsyncIterator
 from azure.core.credentials import AzureKeyCredential
 from azure.identity.aio import DefaultAzureCredential
 from azure.ai.voicelive.aio import connect, VoiceLiveConnection
+from azure.ai.voicelive.aio import ConnectionError as VoiceLiveConnectionError
 from azure.ai.voicelive.models import (
     AzureStandardVoice,
     InputAudioFormat,
@@ -182,25 +183,17 @@ class VoiceAssistantWorker:
     # SAUDAÇÃO INICIAL
     # ==========================================================================
     async def _send_greeting_if_needed(self):
-        """
-        Envia saudação inicial, caso configurada no AgentConfig.
-
-        A saudação é disparada após um pequeno delay para garantir que:
-        - a sessão já esteja totalmente configurada
-        - o Twilio já esteja pronto para receber mídia
-        """
         greeting = getattr(self.agent_config, "greeting", None)
         if not greeting:
             return
 
         await asyncio.sleep(self._greeting_delay)
-        
-        if self._shutdown_event.is_set():
+        if self._shutdown_event.is_set() or not self.connection:
             return
 
         try:
-            logger.info("💬 Enviando saudação inicial...")
-            await self.connection.request.send(input_text=greeting)
+            logger.info("💬 Enviando saudação inicial via response.create()...")
+            await self.connection.response.create()
         except Exception as e:
             logger.error(f"❌ Erro ao enviar saudação inicial: {e}")
 
@@ -250,22 +243,15 @@ class VoiceAssistantWorker:
     # API PÚBLICA: ENTRADA DE ÁUDIO (Twilio → Azure)
     # ==========================================================================
     async def send_user_audio(self, pcm_bytes: bytes) -> None:
-        """
-        Envia áudio do usuário para o Azure.
-
-        Espera receber PCM16 24 kHz (já convertido pelo transcoder) e
-        envia em base64 via InputAudioBufferResource.append, que aceita
-        apenas parâmetros nomeados.
-        """
-        if not self.connection:
+        if not self.connection or self._shutdown_event.is_set():
             return
 
         try:
-            # 1) PCM16 → base64 (formato esperado pela API)
             audio_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
-
-            # 2) append keyword-only
             await self.connection.input_audio_buffer.append(audio=audio_b64)
+        except VoiceLiveConnectionError as e:
+            logger.error(f"🔌 Conexão Azure fechando/fechada ao enviar áudio: {e}")
+            self._shutdown_event.set()
         except Exception as e:
             logger.error(f"❌ Erro ao enviar áudio para Azure: {e}", exc_info=True)
 
