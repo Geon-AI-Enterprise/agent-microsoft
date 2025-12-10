@@ -14,14 +14,10 @@ IMPORTANTE: Este módulo NÃO realiza:
 - VAD (detecção de voz) → Responsabilidade do Azure (Server VAD habilitado)
 - Barge-in → Responsabilidade do Azure
 - Controle de turnos → Responsabilidade do Azure
-- Commit manual de buffer → Server VAD faz isso automaticamente
-
-O Azure VoiceLive com Server VAD cuida de:
-- Detectar início/fim de fala do usuário
-- Interromper resposta quando usuário fala (barge-in)
-- Gerenciar turnos de conversação
+- Análise de energia/silêncio → Responsabilidade do Azure
 =============================================================================
 """
+
 import base64
 import asyncio
 import logging
@@ -135,48 +131,20 @@ class VoiceAssistantWorker:
     # CONFIGURAÇÃO DE SESSÃO COM SERVER VAD
     # ==========================================================================
     async def _configure_session(self) -> None:
+        """
+        Configura a sessão no Azure VoiceLive com Server VAD habilitado.
+
+        Toda a lógica de:
+        - detecção de início/fim de fala
+        - barge-in
+        - controle de turnos
+
+        fica no próprio serviço do Azure.
+        """
         logger.info("⚙️ Configurando sessão com Server VAD...")
 
         if not self.connection:
             raise RuntimeError("Conexão com Azure VoiceLive ainda não está disponível")
-
-        # Escolhe o tipo de voz:
-        # - Se for nome de voz Azure (ex: 'pt-BR-LuizaNeural') usamos AzureStandardVoice
-        # - Se for voz OpenAI (ex: 'alloy') passamos a string direto
-        voice_name = self.agent_config.voice
-
-        if "-" in voice_name:
-            # Formato típico de voz Azure
-            voice_config = AzureStandardVoice(name=voice_name)
-        else:
-            # Voz OpenAI (string simples)
-            voice_config = voice_name
-
-        # Server VAD - parâmetros sugeridos na doc:
-        vad = ServerVad(
-            threshold=0.5,
-            prefix_padding_ms=300,
-            silence_duration_ms=500,
-        )
-
-        session = RequestSession(
-            modalities=[Modality.TEXT, Modality.AUDIO],
-            voice=voice_config,
-            input_audio_format=InputAudioFormat.PCM16,
-            output_audio_format=OutputAudioFormat.PCM16,
-            turn_detection=vad,
-        )
-
-        # API nova: update(), não configure()
-        await self.connection.session.update(session=session)
-
-        logger.info("✅ Sessão configurada com Server VAD habilitado")
-
-        """
-        Configura a sessão no Azure VoiceLive com Server VAD habilitado.
-        Toda a lógica de VAD/barge-in fica no servidor.
-        """
-        logger.info("⚙️ Configurando sessão com Server VAD...")
 
         # --- Voz do agente ---------------------------------------------------
         voice_name = self.agent_config.voice
@@ -195,7 +163,7 @@ class VoiceAssistantWorker:
             silence_duration_ms=getattr(self.agent_config, "silence_duration_ms", 500),
         )
 
-        # --- Session config (segue padrão da lib) ----------------------------
+        # --- Session config (segue padrão da lib Python) ---------------------
         session = RequestSession(
             model=self.settings.AZURE_VOICELIVE_MODEL,
             modalities=[Modality.TEXT, Modality.AUDIO],
@@ -207,41 +175,7 @@ class VoiceAssistantWorker:
             # instructions=self.agent_config.instructions,
         )
 
-        assert self.connection is not None
         await self.connection.session.update(session=session)
-        logger.info("✅ Sessão configurada com Server VAD habilitado")
-        logger.info("⚙️ Configurando sessão com Server VAD...")
-
-        # Configuração de voz do agente
-        voice = AzureStandardVoice(
-            name=self.agent_config.voice,
-            role="assistant",
-        )
-
-        # Server VAD - TODA a inteligência de detecção de fala fica aqui
-        vad = ServerVad(
-            enable_vad=True,
-            noise_suppression_level="high",
-            # Parâmetros opcionais do AgentConfig (se existirem)
-            # threshold=getattr(self.agent_config, 'vad_threshold', None),
-            # silence_duration_ms=getattr(self.agent_config, 'silence_duration_ms', None),
-        )
-
-        session = RequestSession(
-            modalities=[Modality.INPUT_AUDIO, Modality.OUTPUT_AUDIO],
-            assistant_voice=voice,
-            input_audio_format=InputAudioFormat(
-                encoding="pcm16",
-                sample_rate_hz=24000,
-            ),
-            output_audio_format=OutputAudioFormat(
-                encoding="pcm16",
-                sample_rate_hz=24000,
-            ),
-            vad=vad,
-        )
-
-        await self.connection.session.configure(session)
         logger.info("✅ Sessão configurada com Server VAD habilitado")
 
     # ==========================================================================
@@ -249,16 +183,13 @@ class VoiceAssistantWorker:
     # ==========================================================================
     async def _send_greeting_if_needed(self):
         """
-        Envia saudação inicial após pequeno delay.
-        
-        Se o AgentConfig tiver campo 'greeting', envia como primeira mensagem.
-        O delay evita problemas de timing com o estabelecimento da conexão.
+        Envia saudação inicial, caso configurada no AgentConfig.
+
+        A saudação é disparada após um pequeno delay para garantir que:
+        - a sessão já esteja totalmente configurada
+        - o Twilio já esteja pronto para receber mídia
         """
         greeting = getattr(self.agent_config, "greeting", None)
-        if not greeting:
-            # Tenta também no config dict
-            greeting = self.agent_config.config.get("greeting") if hasattr(self.agent_config, "config") else None
-        
         if not greeting:
             return
 
@@ -290,45 +221,25 @@ class VoiceAssistantWorker:
                 break
 
             # ------------------------------------------------------------------
-            # ÁUDIO DO AGENTE (OUTPUT) - Enfileira para envio ao Twilio
+            # Áudio de saída do agente (Azure → Twilio)
             # ------------------------------------------------------------------
-            if event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
-                # Enfileira os bytes PCM 24k para serem convertidos e enviados
-                await self._agent_audio_queue.put(event.delta)
+            if event.type == ServerEventType.RESPONSE_OUTPUT_AUDIO_DELTA:
+                # event.output_audio_delta é base64 PCM16 24kHz
+                try:
+                    chunk = base64.b64decode(event.output_audio_delta)
+                    await self._agent_audio_queue.put(chunk)
+                except Exception as e:
+                    logger.error(f"❌ Erro ao decodificar áudio do agente: {e}")
 
             # ------------------------------------------------------------------
-            # EVENTOS DE VAD (Apenas logging - Azure cuida de tudo)
+            # Transcrições / logs (opcional, para debug)
             # ------------------------------------------------------------------
-            elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
-                # Azure detectou que usuário começou a falar
-                # Se havia resposta em andamento, Azure já interrompe automaticamente
-                logger.info("🗣️ [Azure VAD] Usuário começou a falar")
-
-            elif event.type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
-                # Azure detectou que usuário parou de falar
-                # Azure vai processar a fala e gerar resposta automaticamente
-                logger.info("🤫 [Azure VAD] Usuário parou de falar")
+            elif event.type == ServerEventType.TRANSCRIPT:
+                text = getattr(event, "text", "")
+                logger.info(f"📝 Transcript: {text}")
 
             # ------------------------------------------------------------------
-            # EVENTOS DE RESPOSTA
-            # ------------------------------------------------------------------
-            elif event.type == ServerEventType.RESPONSE_CREATED:
-                logger.debug("📝 Nova resposta criada pelo Azure")
-
-            elif event.type == ServerEventType.RESPONSE_DONE:
-                logger.debug("✅ Resposta do Azure finalizada")
-
-            # ------------------------------------------------------------------
-            # TRANSCRIÇÕES (Logging para debug/auditoria)
-            # ------------------------------------------------------------------
-            elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
-                logger.info(f"🤖 Agente disse: {event.transcript}")
-
-            elif event.type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
-                logger.info(f"👤 Usuário disse: {event.transcript}")
-
-            # ------------------------------------------------------------------
-            # ERROS
+            # Eventos de erro
             # ------------------------------------------------------------------
             elif event.type == ServerEventType.ERROR:
                 logger.error(f"❌ Erro do Azure: {event.error}")
@@ -355,16 +266,6 @@ class VoiceAssistantWorker:
             await self.connection.input_audio_buffer.append(audio=audio_b64)
         except Exception as e:
             logger.error(f"❌ Erro ao enviar áudio para Azure: {e}", exc_info=True)
-
-        if not self.connection:
-            return
-
-        try:
-            # Apenas append - Server VAD cuida do commit automaticamente
-            audio_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
-            await self.connection.input_audio_buffer.append(pcm_bytes)
-        except Exception as e:
-            logger.error(f"❌ Erro ao enviar áudio para Azure: {e}")
 
     # ==========================================================================
     # API PÚBLICA: SAÍDA DE ÁUDIO (Azure → Twilio)
@@ -400,8 +301,12 @@ class VoiceAssistantWorker:
                 await self.connection.close()
             except Exception:
                 pass
+            finally:
+                # Garante que não reutilizaremos uma conexão fechada
+                self.connection = None
 
         logger.info("👋 Worker finalizado")
+
 
     def shutdown(self):
         """Dispara sinal de shutdown para encerrar o loop de eventos."""
