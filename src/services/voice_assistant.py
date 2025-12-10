@@ -22,7 +22,7 @@ O Azure VoiceLive com Server VAD cuida de:
 - Gerenciar turnos de conversação
 =============================================================================
 """
-
+import base64
 import asyncio
 import logging
 from typing import Optional, AsyncIterator
@@ -137,12 +137,42 @@ class VoiceAssistantWorker:
     async def _configure_session(self):
         """
         Configura a sessão no Azure VoiceLive com Server VAD habilitado.
-        
-        Server VAD (Voice Activity Detection) faz:
-        - Detecta início/fim de fala automaticamente
-        - Commit automático do buffer de áudio
-        - Gerencia barge-in nativamente
+        Toda a lógica de VAD/barge-in fica no servidor.
         """
+        logger.info("⚙️ Configurando sessão com Server VAD...")
+
+        # --- Voz do agente ---------------------------------------------------
+        voice_name = self.agent_config.voice
+
+        # Convenção: se tiver hífen, assumimos voz Azure (pt-BR-FulanoNeural etc.)
+        if "-" in voice_name:
+            voice = AzureStandardVoice(name=voice_name)
+        else:
+            # Voz OpenAI (alloy, shimmer, etc.)
+            voice = voice_name
+
+        # --- Server VAD (turn detection no servidor) -------------------------
+        vad = ServerVad(
+            threshold=getattr(self.agent_config, "vad_threshold", 0.5),
+            prefix_padding_ms=getattr(self.agent_config, "prefix_padding_ms", 300),
+            silence_duration_ms=getattr(self.agent_config, "silence_duration_ms", 500),
+        )
+
+        # --- Session config (segue padrão da lib) ----------------------------
+        session = RequestSession(
+            model=self.settings.AZURE_VOICELIVE_MODEL,
+            modalities=[Modality.TEXT, Modality.AUDIO],
+            voice=voice,
+            input_audio_format=InputAudioFormat.PCM16,
+            output_audio_format=OutputAudioFormat.PCM16,
+            turn_detection=vad,
+            # Se existir um campo de instruções no AgentConfig, você pode ligar aqui:
+            # instructions=self.agent_config.instructions,
+        )
+
+        assert self.connection is not None
+        await self.connection.session.update(session=session)
+        logger.info("✅ Sessão configurada com Server VAD habilitado")
         logger.info("⚙️ Configurando sessão com Server VAD...")
 
         # Configuração de voz do agente
@@ -287,6 +317,7 @@ class VoiceAssistantWorker:
 
         try:
             # Apenas append - Server VAD cuida do commit automaticamente
+            audio_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
             await self.connection.input_audio_buffer.append(pcm_bytes)
         except Exception as e:
             logger.error(f"❌ Erro ao enviar áudio para Azure: {e}")
