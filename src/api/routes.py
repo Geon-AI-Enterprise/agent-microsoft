@@ -155,6 +155,8 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                     elif event_type == "media":
                         # Áudio do usuário chegou
                         if session_worker and session_worker.connection:
+                            if session_worker.is_agent_speaking():
+                                await session_worker.interrupt_agent()
                             # Extrai payload base64 (8kHz μ-law)
                             raw_payload = data["media"]["payload"]
                             

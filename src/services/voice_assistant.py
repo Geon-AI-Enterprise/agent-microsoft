@@ -70,6 +70,7 @@ class VoiceAssistantWorker:
             agent_config: Configurações do agente (voz, modelo, etc.)
             settings: Configurações da aplicação (credenciais Azure, etc.)
         """
+        self._agent_speaking = False
         self.settings = settings or get_settings()
         self.agent_config = agent_config
         self.connection: Optional[VoiceLiveConnection] = None
@@ -223,12 +224,19 @@ class VoiceAssistantWorker:
             # ------------------------------------------------------------------
             # Áudio de saída do agente (Azure → Twilio)
             # ------------------------------------------------------------------
-            if event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
-                try:
-                    audio_bytes = event.delta
-                    await self._agent_audio_queue.put(audio_bytes)
-                except Exception as e:
-                    logger.error(f"❌ Erro ao enfileirar áudio do agente: {e}", exc_info=True)
+            elif event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
+                # agente começou/continua falando
+                self._agent_speaking = True
+                audio_bytes = event.delta  # já tratamos isso antes
+                await self._agent_audio_queue.put(audio_bytes)
+
+            elif event.type in (
+                ServerEventType.RESPONSE_AUDIO_DONE,
+                ServerEventType.RESPONSE_CANCELLED,
+                ServerEventType.RESPONSE_ERROR,
+            ):
+                # agente terminou, foi cancelado ou deu erro
+                self._agent_speaking = False
 
             # ------------------------------------------------------------------
             # Transcrições / logs (opcional, para debug)
@@ -246,6 +254,33 @@ class VoiceAssistantWorker:
             elif event.type == ServerEventType.ERROR:
                 error_msg = getattr(event, "error", None) or getattr(event, "message", str(event))
                 logger.error(f"❌ Erro do Azure: {error_msg}")
+
+    # ==========================================================================
+    # Interrupção do agente
+    # ==========================================================================
+
+    def is_agent_speaking(self) -> bool:
+        return self._agent_speaking
+
+    async def interrupt_agent(self):
+        if not self.connection:
+            return
+
+        # 1) marca que ele já não deveria mais estar falando
+        self._agent_speaking = False
+
+        # 2) limpa o que ainda está na fila de áudio pra Twilio
+        try:
+            while not self._agent_audio_queue.empty():
+                self._agent_audio_queue.get_nowait()
+        except Exception:
+            pass
+
+        # 3) cancela a resposta em andamento no servidor
+        try:
+            await self.connection.response.cancel()  # sem response_id cancela a atual :contentReference[oaicite:3]{index=3}
+        except Exception as e:
+            logger.error(f"❌ Erro ao cancelar resposta em andamento: {e}", exc_info=True)
 
     # ==========================================================================
     # API PÚBLICA: ENTRADA DE ÁUDIO (Twilio → Azure)
