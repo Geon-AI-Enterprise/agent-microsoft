@@ -153,18 +153,11 @@ async def audio_stream(websocket: WebSocket, sip_number: str):
                         logger.info(f"▶️ Stream Twilio iniciado: {stream_sid}")
 
                     elif event_type == "media":
-                        # Áudio do usuário chegou
                         if session_worker and session_worker.connection:
-                            if session_worker.is_agent_speaking():
-                                await session_worker.interrupt_agent()
-                            # Extrai payload base64 (8kHz μ-law)
                             raw_payload = data["media"]["payload"]
-                            
-                            # Converte para PCM 24kHz
                             pcm_24k = transcoder.twilio_to_azure(raw_payload)
                             
                             if pcm_24k:
-                                # Envia para Azure (sem barge-in manual!)
                                 await session_worker.send_user_audio(pcm_24k)
 
                     elif event_type == "stop":
