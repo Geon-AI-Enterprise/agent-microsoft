@@ -216,16 +216,31 @@ class VoiceAssistantWorker:
         # ------------------------------------------------------------------
         # Áudio de saída do agente (Azure → Twilio)
         # ------------------------------------------------------------------
-        if event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
-            # agente começou/continua falando
-            self._agent_speaking = True
-            audio_bytes = event.delta  # bytes PCM16 24 kHz
-            await self._agent_audio_queue.put(audio_bytes)
+            if event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
+                try:
+                    # CORREÇÃO: O SDK já entrega bytes em event.delta.
+                    # Não decodifique base64. Não use getattr antigo.
+                    # Apenas pegue e passe adiante.
+                    if event.delta:
+                        await self._agent_audio_queue.put(event.delta)
+                        self._agent_speaking = True
+                except Exception as e:
+                    logger.error(f"❌ Erro ao processar áudio delta: {e}")
 
-        elif event.type == ServerEventType.RESPONSE_AUDIO_DONE:
-            # agente terminou a fala atual
-            self._agent_speaking = False
+            elif event.type == ServerEventType.RESPONSE_AUDIO_DONE:
+                self._agent_speaking = False
 
+            # --- TRANSCRIÇÃO ---
+            elif event.type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DELTA:
+                # Mesmo princípio: event.delta deve ser a string de texto pronta
+                text = getattr(event, "delta", "")
+                if text:
+                    logger.info(f"📝 Transcript: {text}")
+
+            # --- ERROS ---
+            elif event.type == ServerEventType.ERROR:
+                error_msg = getattr(event, "message", None) or getattr(event, "error", str(event))
+                logger.error(f"❌ Erro do Azure: {error_msg}")
         # ------------------------------------------------------------------
         # Transcrições / logs (opcional, para debug)
         # ------------------------------------------------------------------
@@ -276,17 +291,18 @@ class VoiceAssistantWorker:
     # API PÚBLICA: ENTRADA DE ÁUDIO (Twilio → Azure)
     # ==========================================================================
     async def send_user_audio(self, pcm_bytes: bytes) -> None:
-        if not self.connection or self._shutdown_event.is_set():
+        if not self.connection:
             return
 
         try:
-            audio_b64 = base64.b64encode(pcm_bytes).decode("utf-8")
-            await self.connection.input_audio_buffer.append(audio=audio_b64)
-        except VoiceLiveConnectionError as e:
-            logger.error(f"🔌 Conexão Azure fechando/fechada ao enviar áudio: {e}")
-            self._shutdown_event.set()
+            # CORREÇÃO: Passa os bytes crus diretamente.
+            # O SDK cuida da codificação para o protocolo.
+            await self.connection.input_audio_buffer.append(audio=pcm_bytes)
         except Exception as e:
-            logger.error(f"❌ Erro ao enviar áudio para Azure: {e}", exc_info=True)
+            if "closing transport" in str(e) or "Connection reset" in str(e):
+                pass
+            else:
+                logger.error(f"❌ Erro ao enviar áudio para Azure: {e}")
 
     # ==========================================================================
     # API PÚBLICA: SAÍDA DE ÁUDIO (Azure → Twilio)
