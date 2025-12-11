@@ -244,21 +244,21 @@ class VoiceAssistantWorker:
         # ------------------------------------------------------------------
         # Transcrições / logs (opcional, para debug)
         # ------------------------------------------------------------------
-        elif event.type in (
+            elif event.type in (
             ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DELTA,
             ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE,
         ):
-            text = getattr(event, "delta", None) or getattr(event, "transcript", "")
-            logger.info(f"📝 Agent transcript ({event.type}): {text}")
+                text = getattr(event, "delta", None) or getattr(event, "transcript", "")
+                logger.info(f"📝 Agent transcript ({event.type}): {text}")
 
         # ------------------------------------------------------------------
         # Eventos de erro
         # ------------------------------------------------------------------
-        elif event.type == ServerEventType.ERROR:
+            elif event.type == ServerEventType.ERROR:
             # em caso de erro, considera que o agente não está mais falando
-            self._agent_speaking = False
-            error_msg = getattr(event, "error", None) or getattr(event, "message", str(event))
-            logger.error(f"❌ Erro do Azure: {error_msg}")
+                self._agent_speaking = False
+                error_msg = getattr(event, "error", None) or getattr(event, "message", str(event))
+                logger.error(f"❌ Erro do Azure: {error_msg}")
 
     # ==========================================================================
     # Interrupção do agente
