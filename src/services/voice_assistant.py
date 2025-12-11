@@ -165,6 +165,12 @@ class VoiceAssistantWorker:
             silence_duration_ms=getattr(self.agent_config, "silence_duration_ms", 500),
         )
 
+        instructions = getattr(self.agent_config, "instructions", None) or (
+            "Você é um assistente de voz que fala exclusivamente português do Brasil. "
+            "Responda sempre em português brasileiro, mesmo que o usuário fale outra língua. "
+            "Use um tom natural e conversacional."
+        )
+
         # --- Session config (segue padrão da lib Python) ---------------------
         session = RequestSession(
             model=self.settings.AZURE_VOICELIVE_MODEL,
@@ -218,13 +224,11 @@ class VoiceAssistantWorker:
             # Áudio de saída do agente (Azure → Twilio)
             # ------------------------------------------------------------------
             if event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
-                # event.output_audio_delta é base64 PCM16 24kHz
                 try:
-                    b64_data = getattr(event, "delta", None) or getattr(event, "output_audio_delta", "")
-                    chunk = base64.b64decode(b64_data)
-                    await self._agent_audio_queue.put(chunk)
+                    audio_bytes = event.delta
+                    await self._agent_audio_queue.put(audio_bytes)
                 except Exception as e:
-                    logger.error(f"❌ Erro ao decodificar áudio do agente: {e}")
+                    logger.error(f"❌ Erro ao enfileirar áudio do agente: {e}", exc_info=True)
 
             # ------------------------------------------------------------------
             # Transcrições / logs (opcional, para debug)
