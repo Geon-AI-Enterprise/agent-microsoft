@@ -209,55 +209,41 @@ class VoiceAssistantWorker:
     # LOOP PRINCIPAL DE EVENTOS (SIMPLIFICADO)
     # ==========================================================================
     async def _process_events(self):
-        """
-        Processa eventos do Azure VoiceLive.
-        
-        Este loop é SIMPLES porque toda a lógica de VAD/barge-in está no Azure:
-        - Recebe áudio do agente → enfileira para envio ao Twilio
-        - Recebe eventos de fala → apenas loga (Azure já cuida do barge-in)
-        - Recebe transcrições → loga para debug/auditoria
-        """
         async for event in self.connection:
             if self._shutdown_event.is_set():
                 break
 
-            event_type = event.type  # atalho
+        # ------------------------------------------------------------------
+        # Áudio de saída do agente (Azure → Twilio)
+        # ------------------------------------------------------------------
+        if event.type == ServerEventType.RESPONSE_AUDIO_DELTA:
+            # agente começou/continua falando
+            self._agent_speaking = True
+            audio_bytes = event.delta  # bytes PCM16 24 kHz
+            await self._agent_audio_queue.put(audio_bytes)
 
-            # ------------------------------------------------------------------
-            # Áudio de saída do agente (Azure → Twilio)
-            # ------------------------------------------------------------------
-            if event_type == ServerEventType.RESPONSE_AUDIO_DELTA:
-                # agente começou/continua falando
-                self._agent_speaking = True
-                # No SDK novo, delta já é bytes PCM16 24kHz
-                audio_bytes = event.delta
-                await self._agent_audio_queue.put(audio_bytes)
+        elif event.type == ServerEventType.RESPONSE_AUDIO_DONE:
+            # agente terminou a fala atual
+            self._agent_speaking = False
 
-            elif (
-                event_type == ServerEventType.RESPONSE_AUDIO_DONE
-                or str(event_type) == "response.cancelled"
-                or str(event_type) == "response.completed"
-            ):
-                # agente terminou a fala (normal, cancelada ou completada)
-                self._agent_speaking = False
+        # ------------------------------------------------------------------
+        # Transcrições / logs (opcional, para debug)
+        # ------------------------------------------------------------------
+        elif event.type in (
+            ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DELTA,
+            ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE,
+        ):
+            text = getattr(event, "delta", None) or getattr(event, "transcript", "")
+            logger.info(f"📝 Agent transcript ({event.type}): {text}")
 
-            # ------------------------------------------------------------------
-            # Transcrições / logs (opcional, para debug)
-            # ------------------------------------------------------------------
-            elif event_type in (
-                ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DELTA,
-                ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE,
-            ):
-                text = getattr(event, "delta", None) or getattr(event, "transcript", "")
-                logger.info(f"📝 Agent transcript ({event_type}): {text}")
-
-            # ------------------------------------------------------------------
-            # Eventos de erro
-            # ------------------------------------------------------------------
-            elif event_type == ServerEventType.ERROR:
-                self._agent_speaking = False
-                error_msg = getattr(event, "error", None) or getattr(event, "message", str(event))
-                logger.error(f"❌ Erro do Azure: {error_msg}")
+        # ------------------------------------------------------------------
+        # Eventos de erro
+        # ------------------------------------------------------------------
+        elif event.type == ServerEventType.ERROR:
+            # em caso de erro, considera que o agente não está mais falando
+            self._agent_speaking = False
+            error_msg = getattr(event, "error", None) or getattr(event, "message", str(event))
+            logger.error(f"❌ Erro do Azure: {error_msg}")
 
     # ==========================================================================
     # Interrupção do agente
